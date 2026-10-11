@@ -22,7 +22,7 @@ proc calculator(): Parser[int] =
 template agree(p: untyped, inputs: openArray[string]) =
   for input in inputs:
     let slow = p.parse(input)
-    let fast = p.fastParseOn(Context(input: Input(text: input)))
+    let fast = p.fastParseOn(Context(input: newInput(input)))
     check (if slow.isSuccess: slow.pos else: -1) == fast
 
 suite "leaves":
@@ -135,15 +135,15 @@ suite "combinators":
     let num = digit().map((c: char) => parseInt($c))
     let even = num.where((n) => n mod 2 == 0, "even digit")
     check even.parse("4").value == 4
-    check even.parse("3").message == "expected even digit at 1:1"
+    check even.parse("3").message == "expected even digit at 1:2"
     check not even.accepts("3")
     agree even, ["4", "3", "x"]
 
   test "callCC wraps a delegate":
     var calls = 0
-    let traced = digit().callCC(proc (next: (Context) -> Result[char], ctx: Context): Result[char] =
+    let traced = digit().callCC(proc (next: Parser[char], ctx: Context): Result[char] =
       inc calls
-      next(ctx))
+      next.parseOn(ctx))
     check traced.plus.parse("12x").value == @['1', '2']
     check calls == 3
 
@@ -190,10 +190,10 @@ suite "recursion and resolve":
     check cycles   # primary -> parens -> expr -> term -> primary
     check calc.parse("((((7))))").value == 7
 
-  test "unresolved reference is a build error":
-    let p = undefined[int]("missing")
-    expect ValueError:
-      discard (p & ch('a')).resolve
+  test "an undefined reference fails as itself":
+    let p = (undefined[int]("missing") & ch('a')).resolve
+    check p.parse("a").message == "expected missing at 1:1"
+    check not p.accepts("a")
 
 suite "bytes":
   test "byte leaves and byte input":

@@ -57,6 +57,34 @@ and duplicates are not checked. `ceParser` reads one value and
 `ceDocument` reads a `.blb` file. The tests decode the corpus and check
 it against the text.
 
+- `extended_bassline_text`
+
+  The text syntax with dialect blocks. `lang NAME [[ … ]]` reads the
+block with the parser registered as NAME and puts its value where the
+block stands, so another notation can be written inside bassline text
+and still read as values. `extendedParser(dialects)` and
+`extendedDocument(dialects)` take a `Dialects` table of name to
+`Parser[BlNode]`. `standardDialects()` holds `sexp` and `json`.
+
+  ```nim
+  var dialects = standardDialects()
+  dialects["words"] = word().plus.flatten("word").map(sym).trim.star.map(list)
+  let p = extendedParser(dialects)
+  echo p.parse("(q lang words [[ hello world ]] lang json [[ {\"a\": [1, 2]} ]])").value
+  ```
+
+  The block is a Lua long bracket. `[=[ … ]=]` at any level of `=` holds
+content with `]]` in it, and a block inside a block needs a higher
+level. `lang` is reserved, so the symbol has to be written `'lang'`. A
+mark after the block, `lang sexp [[ a ]]!`, marks its value.
+
+  A dialect is any `Parser[BlNode]`. It runs on the document itself with
+the input cut at the closing bracket, so `endOfInput` matches there, a
+failure inside reports its position in the document, and a dialect that
+stops short fails with `the end of the block`. Resolve a dialect before
+registering it. The parser also runs at compile time, so a document with
+blocks can be read into a constant.
+
 ## Using the parsers
 
 A parser is a value. Combining parsers gives you a new parser. Call
@@ -157,7 +185,8 @@ parts of a tuple you do not want.
 `token` wraps the value in a `Token` with `start`, `stop` and `text`.
 
 `where(pred, "expected …")` keeps the value when `pred` holds and fails
-otherwise. The failure is reported where `p` started.
+otherwise. The failure is reported where `p` ended, so it is the
+furthest failure and shows in the message.
 
 `optional` returns an `Option`. `optional(p, default)` returns `R` and
 uses `default` when `p` does not match.
@@ -179,8 +208,13 @@ a byte. `neg(ch('"')).star.flatten` reads a string body.
 ### Recursion
 
 A production that refers to itself, or to one that is defined later,
-starts out as `undefined`. Call `define` once its parts exist. `resolve`
-then removes the placeholder from the graph.
+starts out as `undefined`. Until `define` it fails with its name. Call
+`define` once its parts exist. `resolve` then takes the placeholder out
+of the graph and leaves a node that counts how deep the references nest.
+Past `MaxDepth` levels (1000, set with `-d:MaxDepth=…`) the parse fails
+with `expected shallower nesting` instead of running out of stack. In a
+debug build Nim's own call depth limit of 2000 calls is hit first, at
+about 200 levels of the bassline grammar.
 
 ```nim
 let value = undefined[int]("value")
@@ -201,7 +235,9 @@ messages. A failure reports the furthest position any node reached and
 everything that was expected there, without duplicates, like `expected
 one of ')', '+' at 1:11`. Wrappers that cannot fail on their own (`map`,
 `optional`, the repetitions) use the name of their delegate. `flatten` and
-`skip` do the same unless you give them a name.
+`skip` do the same unless you give them a name. An unnamed choice is
+described by its alternatives, `one of digit, '-'`, and an unnamed
+sequence by its parts, `'-' then digit`.
 
 ### Operator precedence
 
@@ -222,12 +258,14 @@ let calc = b.build.complete
 
 ### Extending
 
-`callCC(handler)` gives `handler` the delegate as a continuation along
-with the current `Context`. The handler can call it, skip it or call it
-more than once. This is how you write tracing, profiling and
-memoisation. `succeed(value, pos)` and `fail[R](node, ctx)` build results.
-`children`, `replace` and `allParsers` are the graph protocol that
-`resolve` is built on.
+`callCC(handler)` gives `handler` the delegate parser along with the
+current `Context`. The handler can run it with `parseOn`, skip it, run
+it somewhere else or run it more than once. This is how you write
+tracing, profiling, memoisation and dispatch on what was just read. `succeed(value, pos)` and `fail[R](node, ctx)` build results
+and `failedAs(T, r)` carries a failure over to another result type. A
+handler may set `Input.stop` to make the rest of the input end early for
+a delegate, which is how dialect blocks are read. `children`, `replace`
+and `allParsers` are the graph protocol that `resolve` is built on.
 
 ### How it runs
 
@@ -245,8 +283,6 @@ atlas-run tests
 # or if you use nimble
 nimble test
 ```
-
-Ensure that your `nim.cfg` compiles with `-d:nimPreviewHashRef` as the parser graph needs it.
 
 ## License
 

@@ -18,9 +18,6 @@ proc headerData(b: byte): Header =
     lll: uint8 = b and 0x07
   (tag, lll, mark)
 
-template failedAs(T: typedesc, r: untyped): untyped =
-  Result[T](isSuccess: false, failed: r.failed, pos: r.pos)
-
 func length(text: string, pos: var int, lll: uint8): int =
   ## The payload length after a header: `lll` itself, or the medium or
   ## large form it announces, read from `pos`. -1 when that is cut short.
@@ -75,8 +72,8 @@ proc ceValue(): Parser[BlNode] =
       succeed(v, r.pos)
 
   let node = anyByte().map(headerData).callCC(
-    proc (next: (Context) -> Result[Header], ctx: Context): Result[BlNode] =
-      let h = next(ctx)
+    proc (next: Parser[Header], ctx: Context): Result[BlNode] =
+      let h = next.parseOn(ctx)
       if not h.isSuccess: return failedAs(BlNode, h)
       let head = h.value
       case head.tag

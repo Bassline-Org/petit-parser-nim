@@ -2,7 +2,7 @@
 ## a light tree. Numbers are kept as spelled with the `_` separators
 ## removed, bytes are kept as bytes, and text and symbols are decoded.
 
-import std/[strutils, sugar]
+import std/[hashes, sequtils, sets, strutils, sugar]
 import ../parser
 
 type
@@ -18,7 +18,7 @@ type
     of bkList, bkRecord, bkSet: items*: seq[BlNode]
     of bkDict: entries*: seq[(BlNode, BlNode)]
 
-const Delims = " \t\n\r[]{}():'\";!"
+const Delims* = " \t\n\r[]{}():'\";!"
 
 func `==`*(a, b: BlNode): bool =
   if a.kind != b.kind or a.mark != b.mark: return false
@@ -29,6 +29,16 @@ func `==`*(a, b: BlNode): bool =
   of bkList, bkRecord, bkSet: a.items == b.items
   of bkDict: a.entries == b.entries
 
+func hash*(n: BlNode): Hash =
+  var h = hash(n.kind) !& hash(n.mark)
+  case n.kind
+  of bkNil: discard
+  of bkInt, bkText, bkSymbol: h = h !& hash(n.text)
+  of bkBytes: h = h !& hash(n.bytes)
+  of bkList, bkRecord, bkSet: h = h !& hash(n.items)
+  of bkDict: h = h !& hash(n.entries)
+  !$h
+
 proc toBytes*(s: string): seq[byte] = @(s.toOpenArrayByte(0, s.high))
 
 proc marked(n: BlNode): BlNode =
@@ -36,14 +46,16 @@ proc marked(n: BlNode): BlNode =
   result.mark = true
 
 proc allDifferent(items: seq[BlNode]): bool =
-  for i in 1 ..< items.len:
-    if items[i] in items[0 ..< i]: return false
+  var seen: HashSet[BlNode]
+  for i in items:
+    if seen.containsOrIncl(i): return false
   true
 
 proc uniqueKeys(entries: seq[(BlNode, BlNode)]): bool =
-  var keys: seq[BlNode]
-  for (k, _) in entries: keys.add k
-  allDifferent(keys)
+  var seen: HashSet[BlNode]
+  for (k, _) in entries:
+    if seen.containsOrIncl(k): return false
+  true
 
 proc unescaped(c: char): string =
   case c
@@ -58,10 +70,13 @@ proc quoted(q: char): Parser[string] =
     run = noneOf($q & "\\", "character").plus.flatten
   delimited(ch(q), ch(q), (run / escape).star).map(parts => parts.join)
 
-proc space(): Parser[Nothing] =
+proc space*(): Parser[Nothing] =
+  ## Whitespace or a `;` comment.
   chars(" \t\n\r", "whitespace").skip / (ch(';') & neg(newline()).star).skip
 
-proc basslineForm(): Parser[BlNode] =
+proc basslineValue*(extensions: seq[Parser[BlNode]] = @[], reserved: seq[string] = @[]): Parser[BlNode] =
+  ## One value, bare. `extensions` are tried before a symbol, and the
+  ## `reserved` words are never read as one.
   let
     ws = space()
     value = undefined[BlNode]("value")
@@ -82,8 +97,10 @@ proc basslineForm(): Parser[BlNode] =
     text = quoted('"').map(s => BlNode(kind: bkText, text: s))
     quotedSymbol = quoted('\'').map(s => BlNode(kind: bkSymbol, text: s))
     bare = noneOf(Delims, "symbol character").plus.flatten("symbol")
-    symbol = (notAhead(numberStart) & bare).map(m => BlNode(kind: bkSymbol, text: m[1]))
-    rawAtom = bytesTok / numberTok / nilTok / text / quotedSymbol / symbol
+    keyword = choice(reserved.map(w => (str(w) & ends).skip("'" & w & "'")))
+    symbol = sequence((notAhead(numberStart), notAhead(keyword), bare))
+      .map(m => BlNode(kind: bkSymbol, text: m[2]))
+    rawAtom = choice(@[bytesTok, numberTok, nilTok, text, quotedSymbol] & extensions & @[symbol])
     atom = (rawAtom & (ch('!') & ends).optional)
       .map(m => (if m[1].isSome: marked(m[0]) else: m[0]))
 
@@ -91,21 +108,43 @@ proc basslineForm(): Parser[BlNode] =
       .map(items => BlNode(kind: bkList, items: items))
     record = delimited(ch('('), ch(')').trim(ws), form.plus)
       .map(items => BlNode(kind: bkRecord, items: items))
-    entry = (form & ch(':').trim(ws)).pick(0) & form
-    emptySet = (ch('{') & ch('}').trim(ws)).map(_ => BlNode(kind: bkSet))
-    emptyDict = sequence((ch('{'), ch(':').trim(ws), ch('}').trim(ws)))
-      .map(_ => BlNode(kind: bkDict))
-    dict = delimited(ch('{'), ch('}').trim(ws), entry.plus)
-      .where(uniqueKeys, "distinct keys")
-      .map(entries => BlNode(kind: bkDict, entries: entries))
-    pset = delimited(ch('{'), ch('}').trim(ws), form.plus)
-      .where(allDifferent, "distinct members")
-      .map(items => BlNode(kind: bkSet, items: items))
-    frame = list / record / emptySet / emptyDict / dict / pset
+    colon = ch(':').trim(ws)
+    entries = ((form & colon).pick(0) & form).star
+    members = form.star
+    sameKey = failure[BlNode]("distinct keys")
+    sameMember = failure[BlNode]("distinct members")
+    # the first member, read once, decides between a dict and a set
+    braced = (form & (colon & form).pick(1).optional).callCC(
+      proc (next: Parser[(BlNode, Option[BlNode])], ctx: Context): Result[BlNode] =
+        var f = next.parseOn(ctx)
+        if not f.isSuccess: return failedAs(BlNode, f)
+        var (k, v) = f.take
+        if v.isSome:
+          var r = entries.parseOn(ctx.at(f.pos))
+          if not r.isSuccess: return failedAs(BlNode, r)
+          var es = r.take
+          es.insert((move k, v.get), 0)
+          if not uniqueKeys(es): return fail[BlNode](sameKey, ctx.at(r.pos))
+          succeed(BlNode(kind: bkDict, entries: es), r.pos)
+        else:
+          var r = members.parseOn(ctx.at(f.pos))
+          if not r.isSuccess: return failedAs(BlNode, r)
+          var items = r.take
+          items.insert(move k, 0)
+          if not allDifferent(items): return fail[BlNode](sameMember, ctx.at(r.pos))
+          succeed(BlNode(kind: bkSet, items: items), r.pos))
+    emptyDict = colon.map(_ => BlNode(kind: bkDict))
+    emptySet = epsilon(BlNode(kind: bkSet))
+    braces = delimited(ch('{'), ch('}').trim(ws), emptyDict / braced / emptySet)
+    frame = list / record / braces
     markedFrame = (ch('!') & frame).pick(1).map(marked)
 
   value.define(markedFrame / frame / atom)
-  form
+  value
+
+proc basslineForm*(extensions: seq[Parser[BlNode]] = @[], reserved: seq[string] = @[]): Parser[BlNode] =
+  ## One value and the space around it.
+  basslineValue(extensions, reserved).trim(space())
 
 proc basslineParser*(): Parser[BlNode] =
   ## Exactly one value.
