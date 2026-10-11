@@ -1,0 +1,12 @@
+*
+!*/
+!*.*
+nimcache/
+.nimcache/
+nimblecache/
+htmldocs/
+/deps
+nimble.develop
+nimble.paths
+nimbledeps
+bin/
