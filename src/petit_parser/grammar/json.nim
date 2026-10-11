@@ -49,7 +49,8 @@ proc jsonParser*(): Parser[JsonValue] =
     integer = ch('0').skip / (between('1', '9') & digit().star).skip
     fraction = (ch('.') & digits).skip.optional
     exponent = (chars("eE", "exponent") & chars("+-", "sign").optional & digits).skip.optional
-    jsonNumber = sequence((ch('-').optional, integer, fraction, exponent)).flatten("number").trim(ws)
+    jsonNumber = sequence((ch('-').optional, integer, fraction, exponent))
+      .flatten("number").trim(ws)
       .map(s => JsonValue(kind: jkNumber, numberVal: s))
 
     tru = str("true").map(_ => JsonValue(kind: jkBool, boolVal: true))
@@ -59,11 +60,11 @@ proc jsonParser*(): Parser[JsonValue] =
 
     jsonString = text.map(s => JsonValue(kind: jkString, stringVal: s))
     comma = ch(',').trim(ws)
-    jsonArray = delimited(ch('[').trim(ws), ch(']').trim(ws), value.starSeparated(comma))
-      .map(m => JsonValue(kind: jkArray, arrayVal: m.elements))
-    entry = sequence((text, ch(':').trim(ws), value)).map(m => (m[0], m[2]))
-    jsonObj = delimited(ch('{').trim(ws), ch('}').trim(ws), entry.starSeparated(comma))
-      .map(m => JsonValue(kind: jkObject, objectVal: m.elements.toTable))
+    jsonArray = delimited(ch('[').trim(ws), ch(']').trim(ws), value.starSeparated(comma).elements)
+      .map(a => JsonValue(kind: jkArray, arrayVal: a))
+    entry = (text & ch(':').trim(ws)).pick(0) & value
+    jsonObj = delimited(ch('{').trim(ws), ch('}').trim(ws), entry.starSeparated(comma).elements)
+      .map(es => JsonValue(kind: jkObject, objectVal: es.toTable))
 
   value.define(jsonObj / jsonArray / jsonNumber / jsonString / jsonLiteral)
   value.complete.resolve

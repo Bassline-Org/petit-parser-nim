@@ -42,6 +42,21 @@ as strings and decodes unicode strings.
   Implements an extremely naiive sexp grammar with the atoms, strings, 
 lists, quoting, and `;` comments.
 
+- `bassline_text`
+
+  Reads the bassline textual syntax into a light tree. Numbers are kept
+as spelled, bytes as bytes, and text is decoded. `basslineParser` reads one value
+and `basslineDocument` reads any number of them. The tests run the
+shared bassline corpus against it.
+
+- `bassline_ce`
+
+  Reads bassline's canonical binary encoding into the same tree, without
+validating it. Lengths are taken as stated and integers, utf-8, order
+and duplicates are not checked. `ceParser` reads one value and
+`ceDocument` reads a `.blb` file. The tests decode the corpus and check
+it against the text.
+
 ## Using the parsers
 
 A parser is a value. Combining parsers gives you a new parser. Call
@@ -125,7 +140,10 @@ associative operator level.
 ### Reading values
 
 `p.map(fn)` or `p ==> fn` transforms the value. `fn` is assumed to be pure
-and is skipped when the parser is only recognising.
+and is skipped when the parser is only recognising. `fn` gets a copy of the
+value. `pick(i)` takes one value out of a tuple without copying it, so
+prefer it to `map(t => t[i])`, and `elements` does the same for a
+separated list.
 
 `flatten` returns the text that `p` consumed as a string and does not
 build any of `p`'s values. `flatten("number")` gives it a name for

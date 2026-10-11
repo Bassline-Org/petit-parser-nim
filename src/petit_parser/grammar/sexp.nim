@@ -40,7 +40,7 @@ proc sexpParser*(): Parser[Sexp] =
     sexp = undefined[Sexp]("sexp")
     form = sexp.trim(ws)
 
-    quote = (ch('\'') & form).map(m => quoting(m[1]))
+    quote = (ch('\'') & form).pick(1).map(quoting)
     escape = (str("\\") & chars("\"\\nt", "escape")).map(m => escaped(m[1]))
     run = noneOf("\"\\", "character").plus.flatten
     text = delimited(ch('"'), ch('"'), (run / escape).star)

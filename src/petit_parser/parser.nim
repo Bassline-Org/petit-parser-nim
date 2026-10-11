@@ -58,6 +58,13 @@ func value*[R](r: Result[R]): R =
   else:
     raise newException(ParseError, "tried to access value of a failed result")
 
+proc take*[R](r: var Result[R]): R =
+  ## The value, moved out of the result.
+  if r.isSuccess:
+    move(r.val)
+  else:
+    raise newException(ParseError, "tried to take the value of a failed result")
+
 proc lineCol*(text: string, pos: int): (int, int) =
   let before = text[0 ..< min(pos, text.len)]
   (before.count('\n') + 1, pos - before.rfind('\n'))
@@ -269,9 +276,9 @@ macro sequence*(parsers: tuple): untyped =
     slots.add nnkBracketExpr.newTree(bindSym"Parser", newCall(bindSym"typeof", t))
     takes.add quote do: `q` = `g`
     types.add t
-    values.add newDotExpr(r, ident"val")
+    values.add newCall(ident"move", newDotExpr(r, ident"val"))
     parse.add quote do:
-      let `r` = `q`.parseOn(`ctx`.at(`pos`))
+      var `r` = `q`.parseOn(`ctx`.at(`pos`))
       if not `r`.isSuccess: return propagate(`R`, `r`)
       `pos` = `r`.pos
     fast.add quote do:
@@ -344,12 +351,12 @@ proc repeat*[R](item: Parser[R], min: int, max = -1): Parser[seq[R]] =
       values: seq[R]
       pos = ctx.pos
     while max < 0 or values.len < max:
-      let r = item.parseOn(ctx.at(pos))
+      var r = item.parseOn(ctx.at(pos))
       if not r.isSuccess:
         if values.len < min: return propagate(seq[R], r)
         break
       if r.pos == pos and values.len >= min: break
-      values.add r.val
+      values.add move(r.val)
       pos = r.pos
     succeed(values, pos)
   p.fastFn = proc (ctx: Context): int =
@@ -383,10 +390,10 @@ proc repeatLazy*[R](item: Parser[R], limit: ParserBase, min: int, max = -1): Par
     while values.len < min or limit.fastParseOn(ctx.at(pos)) < 0:
       if values.len >= min and max >= 0 and values.len >= max:
         return fail[seq[R]](limit, ctx.at(pos))
-      let r = item.parseOn(ctx.at(pos))
+      var r = item.parseOn(ctx.at(pos))
       if not r.isSuccess: return propagate(seq[R], r)
       if r.pos == pos and values.len >= min: return fail[seq[R]](limit, ctx.at(pos))
-      values.add r.val
+      values.add move(r.val)
       pos = r.pos
     succeed(values, pos)
   p.fastFn = proc (ctx: Context): int =
@@ -415,15 +422,15 @@ proc repeatGreedy*[R](item: Parser[R], limit: ParserBase, min: int, max = -1): P
       values: seq[R]
       pos = ctx.pos
     while values.len < min:
-      let r = item.parseOn(ctx.at(pos))
+      var r = item.parseOn(ctx.at(pos))
       if not r.isSuccess: return propagate(seq[R], r)
-      values.add r.val
+      values.add move(r.val)
       pos = r.pos
     var stops = @[pos]
     while max < 0 or values.len < max:
-      let r = item.parseOn(ctx.at(pos))
+      var r = item.parseOn(ctx.at(pos))
       if not r.isSuccess or r.pos == pos: break
-      values.add r.val
+      values.add move(r.val)
       pos = r.pos
       stops.add pos
     while limit.fastParseOn(ctx.at(stops[^1])) < 0:
@@ -477,13 +484,13 @@ proc repeatSeparated*[R, S](item: Parser[R], sep: Parser[S], min: int,
           if list.elements.len < min: return propagate(Separated[R, S], s)
           break
         at = s.pos
-      let r = item.parseOn(ctx.at(at))
+      var r = item.parseOn(ctx.at(at))
       if not r.isSuccess:
         if list.elements.len < min: return propagate(Separated[R, S], r)
         break
       if r.pos == pos and list.elements.len >= min: break
-      if list.elements.len > 0: list.separators.add s.val
-      list.elements.add r.val
+      if list.elements.len > 0: list.separators.add move(s.val)
+      list.elements.add move(r.val)
       pos = r.pos
     succeed(list, pos)
   p.fastFn = proc (ctx: Context): int =
@@ -529,47 +536,62 @@ proc foldRight*[R, S](list: Separated[R, S], fn: (R, S, R) -> R): R =
 # ---------------------------------------------------------------------------
 # One delegate, its result read anew
 
-proc through[D, R](p: Parser[D], read: (Result[D], Context) -> Result[R],
+proc through[D, R](p: Parser[D], read: (var Result[D], Context) -> Result[R],
                    fast: (int, int) -> int = (stop, start: int) => stop): Parser[R] =
   var p = p
   let t = Parser[R](expected: p.expected)
-  t.parseFn = (ctx: Context) => read(p.parseOn(ctx), ctx)
+  t.parseFn = proc (ctx: Context): Result[R] =
+    var r = p.parseOn(ctx)
+    read(r, ctx)
   t.fastFn = (ctx: Context) => fast(p.fastParseOn(ctx), ctx.pos)
   t.over(p)
   t
 
 proc optional*[R](p: Parser[R]): Parser[Option[R]] =
-  p.through((r: Result[R], ctx: Context) => (if r.isSuccess: succeed(some(r.val), r.pos)
+  p.through((r: var Result[R], ctx: Context) => (if r.isSuccess: succeed(some(move(r.val)), r.pos)
                                      else: succeed(none(R), ctx.pos)),
     (stop, start: int) => max(stop, start))
 
 proc optional*[R](p: Parser[R], value: R): Parser[R] =
   ## `p`, or `value` where `p` does not match.
-  p.through((r: Result[R], ctx: Context) => (if r.isSuccess: r else: succeed(value, ctx.pos)),
+  p.through((r: var Result[R], ctx: Context) => (if r.isSuccess: move(r)
+                                                 else: succeed(value, ctx.pos)),
     (stop, start: int) => max(stop, start))
 
 proc map*[A, B](p: Parser[A], fn: (A) -> B): Parser[B] =
   ## `fn` is taken as pure: the fast path skips it.
-  p.through((r: Result[A], ctx: Context) =>
+  p.through((r: var Result[A], ctx: Context) =>
     (if r.isSuccess: succeed(fn(r.val), r.pos) else: propagate(B, r)))
 
+proc pick*[T: tuple](p: Parser[T], i: static int): Parser[typeof(default(T)[i])] =
+  ## One value of a tuple, moved out. `map(t => t[i])` copies it.
+  p.through((r: var Result[T], ctx: Context) =>
+    (if r.isSuccess: succeed(move(r.val[i]), r.pos)
+     else: propagate(typeof(default(T)[i]), r)))
+
+proc elements*[R, S](p: Parser[Separated[R, S]]): Parser[seq[R]] =
+  ## The elements of a separated list, moved out.
+  p.through((r: var Result[Separated[R, S]], ctx: Context) =>
+    (if r.isSuccess: succeed(move(r.val.elements), r.pos) else: propagate(seq[R], r)))
+
 proc delimited*[A, B, C](open: Parser[A], close: Parser[C], inside: Parser[B]): Parser[B] =
-  sequence((open, inside, close))
-    .map m => m[1]
+  ## `inside` between `open` and `close`, keeping only its value.
+  sequence((open, inside, close)).pick(1)
 
 proc `==>`*[A, B](p: Parser[A], fn: (A) -> B): Parser[B] = p.map(fn)
 
 proc token*[R](p: Parser[R]): Parser[Token[R]] =
-  p.through(proc (r: Result[R], ctx: Context): Result[Token[R]] =
+  p.through(proc (r: var Result[R], ctx: Context): Result[Token[R]] =
     if r.isSuccess:
-      succeed(Token[R](value: r.val, input: ctx.input, start: ctx.pos, stop: r.pos), r.pos)
+      succeed(Token[R](value: move(r.val), input: ctx.input, start: ctx.pos, stop: r.pos), r.pos)
     else: propagate(Token[R], r))
 
 proc text*[R](t: Token[R]): string = t.input.text[t.start ..< t.stop]
 
 proc ahead*[R](p: Parser[R]): Parser[R] =
   ## Positive lookahead: `p`'s value, no input consumed.
-  p.through((r: Result[R], ctx: Context) => (if r.isSuccess: succeed(r.val, ctx.pos) else: r),
+  p.through((r: var Result[R], ctx: Context) => (if r.isSuccess: succeed(move(r.val), ctx.pos)
+                                                 else: move(r)),
     (stop, start: int) => (if stop < 0: -1 else: start))
 
 proc where*[R](p: Parser[R], pred: (R) -> bool, expected: string): Parser[R] =
@@ -643,8 +665,8 @@ proc trim*[R](p: Parser[R], left, right: ParserBase): Parser[R] =
   var (p, left, right) = (p, left, right)
   let t = Parser[R](expected: "trimmed")
   t.parseFn = proc (ctx: Context): Result[R] =
-    let r = p.parseOn(ctx.at(left.skipAll(ctx)))
-    if r.isSuccess: succeed(r.val, right.skipAll(ctx.at(r.pos))) else: r
+    var r = p.parseOn(ctx.at(left.skipAll(ctx)))
+    if r.isSuccess: succeed(move(r.val), right.skipAll(ctx.at(r.pos))) else: move(r)
   t.fastFn = proc (ctx: Context): int =
     let pos = p.fastParseOn(ctx.at(left.skipAll(ctx)))
     if pos < 0: -1 else: right.skipAll(ctx.at(pos))
@@ -723,4 +745,4 @@ proc accepts*(p: ParserBase, text: string): bool =
 
 proc accepts*(p: ParserBase, data: openArray[byte]): bool = p.accepts(data.toText)
 
-proc complete*[R](p: Parser[R]): Parser[R] = (p & endOfInput()).map((t: (R, Nothing)) => t[0])
+proc complete*[R](p: Parser[R]): Parser[R] = (p & endOfInput()).pick(0)

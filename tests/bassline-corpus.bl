@@ -1,0 +1,220 @@
+;; a shared corpus for every bassline implementation to test against
+;;
+;; each record is one test case, and its head says what kind of case
+;; it is. the expected bytes come from the spec in data-model.org
+;;
+;; every case is input given in total: the bytes or the text are all
+;; there is. input given in total that ends inside a value is bad, but
+;; for running out rather than for breaking a rule, so the starved and
+;; incomplete cases are kept apart from reject and refuses. they are
+;; the inputs where a reader still being given more, bytes arriving on
+;; a socket or text someone is typing, waits instead
+;;
+;; (ce name value 0xbytes)
+;; value must encode to exactly 0xbytes, and 0xbytes must decode to
+;; value. a reading that cannot hold value (an integer past its
+;; integer size, say) reports the case as not held, and still checks
+;; that 0xbytes validates and lands exactly one value
+;;
+;; (reject name 0xbytes reason)
+;; a decoder must refuse 0xbytes. reason names the rule it breaks,
+;; lifted from "what a decoder must reject", one of:
+;;   invalid-tag end-with-bits end-at-top length-bits
+;;   non-minimal-length bad-integer bad-utf8 empty-record
+;;   stranded-key out-of-order duplicate
+;;
+;; (starved name 0xbytes)
+;; 0xbytes is a proper prefix of a value: it breaks no rule, it only
+;; runs out. a decoder must not refuse it and must not land anything.
+;; a decoder still being given bytes waits for more.
+;;
+;; (reads "text" value)
+;; the reader must read text as value. these are spellings the
+;; printer would not produce itself: digit separators, upper-case
+;; hex, comments, quoted forms, alternate whitespace.
+;;
+;; (refuses "text")
+;; the reader must refuse text as a syntax error. the comment after
+;; each case names the rule it breaks.
+;;
+;; (incomplete "text")
+;; text runs out inside a value, having broken no rule before it
+;; does: a prefix of something that could still be valid. reading it
+;; as one value, the reader must report it as incomplete, never
+;; refuse it. text that has already begun a second value can never
+;; be one value, and is refused however it ends.
+;;
+;; (document "text" [values])
+;; reading text as a document must give exactly these values, in
+;; this order. an empty document is a complete document.
+
+;; ================ ce ================
+
+(ce 'nil' nil 0x10)
+(ce nil-marked nil! 0x18)
+(ce zero 0 0x2130)
+(ce one 1 0x2131)
+(ce minus-one -1 0x222d31)
+(ce ten 10 0x223130)
+(ce int-marked 42! 0x2a3432)
+(ce int64-max 9223372036854775807 0x271339323233333732303336383534373735383037)
+(ce int64-min -9223372036854775808 0x27142d39323233333732303336383534373735383038)
+(ce text-empty "" 0x30)
+(ce text-hi "hi" 0x326869)
+(ce text-inline-max "abcdef" 0x36616263646566)
+(ce text-medium-min "abcdefg" 0x370761626364656667)
+(ce text-medium-max "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" 0x37fe6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161)
+(ce text-large-min "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" 0x37ff000000ff616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161)
+(ce text-utf8 "héllo" 0x3668c3a96c6c6f)
+(ce text-escapes "a\n\t\r\\\"b" 0x3707610a090d5c2262)
+(ce text-marked "go"! 0x3a676f)
+(ce sym go 0x42676f)
+(ce sym-marked go! 0x4a676f)
+(ce sym-quoted 'a b' 0x43612062)
+(ce sym-nil 'nil' 0x436e696c)
+(ce sym-empty '' 0x40)
+(ce bytes-empty 0x 0x50)
+(ce bytes 0xdeadbeef 0x54deadbeef)
+(ce bytes-marked 0xff! 0x59ff)
+(ce bytes-large-min 0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 0x57ff000000ff000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000)
+(ce list-empty [] 0x60a0)
+(ce list [1 2 3] 0x60213121322133a0)
+(ce list-nested [[]] 0x6060a0a0)
+(ce list-marked ![a] 0x684161a0)
+(ce list-deep-16 [[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]] 0x60606060606060606060606060606060a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0)
+(ce rec (f) 0x704166a0)
+(ce rec-fields (f 1 "x") 0x70416621313178a0)
+(ce rec-marked !(go 1) 0x7842676f2131a0)
+(ce rec-frame-head ((a) b) 0x70704161a04162a0)
+(ce dict-empty {:} 0x80a0)
+(ce dict {a: 1} 0x8041612131a0)
+(ce dict-shortlex {b: 1 ab: 2} 0x80416221314261622132a0)
+(ce dict-key-kinds {1: a "1": b} 0x802131416131314162a0)
+(ce dict-marked !{k: v} 0x88416b4176a0)
+(ce dict-marked-key {go: 1 go!: 2} 0x8042676f21314a676f2132a0)
+(ce dict-nested {k: {j: [1]}} 0x80416b80416a602131a0a0a0)
+(ce set-empty {} 0x90a0)
+(ce set {3 1 2} 0x90213121322133a0)
+(ce set-shortlex {b ab} 0x904162426162a0)
+(ce set-kinds {nil 0 "" '' 0x [] (h) {:} {}} 0x9010213030405060a0704168a080a090a0a0)
+(ce set-mark-order {x x!} 0x9041784978a0)
+(ce set-shorter-frame-after {[a b] [a]} 0x906041614162a0604161a0a0)
+(ce set-int-order {10 9 -1 1} 0x9021312139222d31223130a0)
+(ce message (msg "hello" 42 {k: v x: [1 2 3]} go!) 0x70436d73673568656c6c6f22343280416b4176417860213121322133a0a04a676fa0)
+(ce int-past-int64 123456789012345678901234567890 0x271e313233343536373839303132333435363738393031323334353637383930)
+(ce int-negative-past-int64 -123456789012345678901234567890 0x271f2d313233343536373839303132333435363738393031323334353637383930)
+
+;; ================ reject ================
+
+(reject tag-zero 0x00 invalid-tag)
+(reject tag-b 0xb0 invalid-tag)
+(reject tag-f 0xf0 invalid-tag)
+(reject end-len-bits 0xa1 end-with-bits)
+(reject end-mark-bit 0xa8 end-with-bits)
+(reject end-at-top 0xa0 end-at-top)
+(reject end-after-value 0x60a0a0 end-at-top)
+(reject nil-len-bits 0x11 length-bits)
+(reject list-len-bits 0x61a0 length-bits)
+(reject medium-form-for-small 0x3703616263 non-minimal-length)
+(reject large-form-for-medium 0x37ff0000001061616161616161616161616161616161 non-minimal-length)
+(reject int-empty 0x20 bad-integer)
+(reject int-negative-zero 0x222d30 bad-integer)
+(reject int-leading-zero 0x223031 bad-integer)
+(reject int-bare-minus 0x212d bad-integer)
+(reject int-not-digits 0x2161 bad-integer)
+(reject text-bad-utf8 0x31ff bad-utf8)
+(reject sym-overlong-utf8 0x42c080 bad-utf8)
+(reject text-surrogate 0x33eda080 bad-utf8)
+(reject record-empty 0x70a0 empty-record)
+(reject dict-stranded-key 0x804161a0 stranded-key)
+(reject dict-out-of-order 0x804162213141612132a0 out-of-order)
+(reject dict-duplicate-key 0x804161213141612132a0 duplicate)
+(reject set-out-of-order 0x9041624161a0 out-of-order)
+(reject set-duplicate 0x9041614161a0 duplicate)
+(reject set-shortlex-violated 0x904261624162a0 out-of-order)
+(reject nested-stranded-key 0x60804161a0a0 stranded-key)
+(reject nested-bad-integer 0x60222d30a0 bad-integer)
+
+;; ================ starved ================
+
+(starved open-list 0x60)
+(starved short-payload 0x336162)
+(starved medium-no-length 0x37)
+(starved large-short-length 0x37ff000000)
+(starved list-unclosed 0x602131)
+(starved dict-key-then-end-of-input 0x804161)
+
+;; ================ reads ================
+
+(reads "1_000" 1000)
+(reads "-1_000" -1000)
+(reads "0xDE_AD" 0xdead)
+(reads "0xDEAD" 0xdead)
+(reads "'nil'" 'nil')
+(reads "nil!" nil!)
+(reads "nilx" nilx)
+(reads "_5" _5)
+(reads "+5" +5)
+(reads "->" ->)
+(reads "'a!b'" 'a!b')
+(reads "{foo:bar}" {foo: bar})
+(reads "{go!: 1}" {go!: 1})
+(reads "; a comment\n5" 5)
+(reads "[go! stop]" [go! stop])
+(reads "(f go! !(g))" (f go! !(g)))
+(reads "\"a\nb\"" "a\nb")
+
+;; ================ refuses ================
+
+(refuses "007")  ; leading zero
+(refuses "-0")  ; negative zero
+(refuses "1.5")  ; no non-integer numbers
+(refuses "42px")  ; number against a symbol
+(refuses "1-2")  ; number against a symbol
+(refuses "1.")  ; number against a symbol
+(refuses "1_")  ; separator at the end
+(refuses "1__000")  ; doubled separator
+(refuses "0_0")  ; leading zero, judged on the digits
+(refuses "0x123")  ; odd count of hex digits
+(refuses "0x_de")  ; separator not between digits
+(refuses "{a b: c}")  ; colon after a set began
+(refuses "{a: 1 b}")  ; member without a value
+(refuses "{: a}")  ; colon first
+(refuses "{a:}")  ; key without a value
+(refuses "{:'}")  ; a value can't follow '{:', so this is refused, not waiting on a quote
+(refuses "!{:\"}")  ; the same, marked, before a text that never ends
+(refuses "{: [1")  ; the same before a frame that never closes
+(refuses "{a: 1 b \"")  ; a dict wants ':' after its key, not a text that never ends
+(refuses "{a: 1 b [1")  ; the same before a frame that never closes
+(refuses "{1 1}")  ; duplicate member
+(refuses "{a: 1 a: 2}")  ; duplicate key
+(refuses "()")  ; record with no head
+(refuses "! (f)")  ; mark separated from its value
+(refuses "!!(f)")  ; repeated mark
+(refuses "!x")  ; atom marked in front
+(refuses "(f)!")  ; frame marked behind
+(refuses "!(f)!")  ; marked twice
+(refuses "a!b")  ; mark inside a token
+(refuses "1 2")  ; readValue wants exactly one value
+(refuses "1 [")  ; a second value has begun, so this can never be one
+(refuses "go !")  ; go, then a mark beginning a second value
+(refuses "")  ; no value at all
+
+;; ================ incomplete ================
+
+(incomplete "[1 2")
+(incomplete "(f a")
+(incomplete "{a: 1")
+(incomplete "{a b")
+(incomplete "{a")
+(incomplete "{a:")
+(incomplete "\"open")
+(incomplete "!")
+(incomplete "[1 [2] ")
+
+;; ================ document ================
+
+(document "1 2 3" [1 2 3])
+(document "; only a comment\n" [])
+(document "" [])
+(document "(a) [b] {c} {d: e} f" [(a) [b] {c} {d: e} f])
