@@ -7,46 +7,46 @@ import std/sugar
 import ./parser
 
 type
-  Group*[R] = ref object
-    loopback: Parser[R]
-    wrappers: seq[Parser[R]]
-    prefixes, postfixes: seq[Parser[(R) -> R]]
-    lefts, rights: seq[Parser[(R, R) -> R]]
+  Group*[S, R] = ref object
+    loopback: Parser[S, R]
+    wrappers: seq[Parser[S, R]]
+    prefixes, postfixes: seq[Parser[S, (R) -> R]]
+    lefts, rights: seq[Parser[S, (R, R) -> R]]
 
-  ExpressionBuilder*[R] = ref object
-    loopback: SettableParser[R]
-    primitives: seq[Parser[R]]
-    groups: seq[Group[R]]
+  ExpressionBuilder*[S, R] = ref object
+    loopback: SettableParser[S, R]
+    primitives: seq[Parser[S, R]]
+    groups: seq[Group[S, R]]
 
-proc newExpressionBuilder*[R](): ExpressionBuilder[R] =
-  ExpressionBuilder[R](loopback: undefined[R]("expression"))
+proc newExpressionBuilder*[S, R](): ExpressionBuilder[S, R] =
+  ExpressionBuilder[S, R](loopback: undefined[S, R]("expression"))
 
-proc primitive*[R](b: ExpressionBuilder[R], p: Parser[R]) = b.primitives.add p
+proc primitive*[S, R](b: ExpressionBuilder[S, R], p: Parser[S, R]) = b.primitives.add p
 
-proc group*[R](b: ExpressionBuilder[R]): Group[R] =
-  result = Group[R](loopback: b.loopback)
+proc group*[S, R](b: ExpressionBuilder[S, R]): Group[S, R] =
+  result = Group[S, R](loopback: b.loopback)
   b.groups.add result
 
-proc wrapper*[R, L, T](g: Group[R], left: Parser[L], right: Parser[T],
-                       action: (L, R, T) -> R): Group[R] {.discardable.} =
+proc wrapper*[S, R, L, T](g: Group[S, R], left: Parser[S, L], right: Parser[S, T],
+                          action: (L, R, T) -> R): Group[S, R] {.discardable.} =
   ## `left`, the whole expression, `right`.
   g.wrappers.add sequence((left, g.loopback, right)).map((t: (L, R, T)) => action(t[0], t[1], t[2]))
   g
 
-proc prefix*[R, O](g: Group[R], op: Parser[O], action: (O, R) -> R): Group[R] {.discardable.} =
+proc prefix*[S, R, O](g: Group[S, R], op: Parser[S, O], action: (O, R) -> R): Group[S, R] {.discardable.} =
   g.prefixes.add op.map((o: O) => ((a: R) => action(o, a)))
   g
 
-proc postfix*[R, O](g: Group[R], op: Parser[O], action: (R, O) -> R): Group[R] {.discardable.} =
+proc postfix*[S, R, O](g: Group[S, R], op: Parser[S, O], action: (R, O) -> R): Group[S, R] {.discardable.} =
   g.postfixes.add op.map((o: O) => ((a: R) => action(a, o)))
   g
 
-proc left*[R, O](g: Group[R], op: Parser[O], action: (R, O, R) -> R): Group[R] {.discardable.} =
+proc left*[S, R, O](g: Group[S, R], op: Parser[S, O], action: (R, O, R) -> R): Group[S, R] {.discardable.} =
   ## Left-associative: `a op b op c` is `(a op b) op c`.
   g.lefts.add op.map((o: O) => ((a, b: R) => action(a, o, b)))
   g
 
-proc right*[R, O](g: Group[R], op: Parser[O], action: (R, O, R) -> R): Group[R] {.discardable.} =
+proc right*[S, R, O](g: Group[S, R], op: Parser[S, O], action: (R, O, R) -> R): Group[S, R] {.discardable.} =
   ## Right-associative: `a op b op c` is `a op (b op c)`.
   g.rights.add op.map((o: O) => ((a, b: R) => action(a, o, b)))
   g
@@ -61,7 +61,7 @@ proc applyPostfixes[R](t: (R, seq[(R) -> R])): R =
 
 proc applyBinary[R](a: R, f: (R, R) -> R, b: R): R = f(a, b)
 
-proc build[R](g: Group[R], inner: Parser[R]): Parser[R] =
+proc build[S, R](g: Group[S, R], inner: Parser[S, R]): Parser[S, R] =
   result = inner
   if g.wrappers.len > 0: result = choice(@[result] & g.wrappers)
   if g.prefixes.len > 0:
@@ -75,7 +75,7 @@ proc build[R](g: Group[R], inner: Parser[R]): Parser[R] =
     let terms = result.plusSeparated(choice(g.lefts))
     result = terms.map((l: Separated[R, (R, R) -> R]) => l.foldLeft(applyBinary[R]))
 
-proc build*[R](b: ExpressionBuilder[R]): Parser[R] =
+proc build*[S, R](b: ExpressionBuilder[S, R]): Parser[S, R] =
   ## The expression parser, its forward references resolved.
   result = choice(b.primitives)
   for g in b.groups: result = g.build(result)

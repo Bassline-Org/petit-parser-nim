@@ -45,4 +45,4 @@ suite "sexp":
     for input in ["(a (b) 'c)", "(a", "x ; c", "\"\\q\""]:
       check p.accepts(input) == p.parse(input).isSuccess
     for n in p.allParsers:
-      check not (n of SettableParser[Sexp])
+      check not (n of SettableParser[string, Sexp])

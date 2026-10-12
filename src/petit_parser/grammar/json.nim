@@ -1,5 +1,5 @@
 import std/[options, strutils, sugar, tables, unicode]
-import ../parser
+import ../../petit_parser
 
 type
   JsonKind* = enum
@@ -31,10 +31,10 @@ proc decoded(hi: int, lo: Option[(string, int)]): string =
   else:
     Rune(hi).toUTF8
 
-proc jsonParser*(): Parser[JsonValue] =
+proc jsonParser*(): TextParser[JsonValue] =
   let
     ws = chars({' ', '\t', '\n', '\r'}, "whitespace")
-    value = undefined[JsonValue]("value")
+    value = undefined[string, JsonValue]("value")
 
     hex4 = chars(HexDigits, "hex digit").times(4).flatten.map(h => parseHexInt(h))
     unicode = sequence((str("\\u"), hex4, (str("\\u") & hex4).optional))

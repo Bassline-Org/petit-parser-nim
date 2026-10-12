@@ -10,8 +10,8 @@ proc apply(a: int, op: char, b: int): int =
 
 proc fold(l: Separated[int, char]): int = l.foldLeft(apply)
 
-proc calculator(): Parser[int] =
-  let expr = undefined[int]("expr")
+proc calculator(): TextParser[int] =
+  let expr = undefined[string, int]("expr")
   let number = digit().plus.flatten("number").map((s: string) => parseInt(s)).trim
   let parens = sequence((ch('(').trim, expr, ch(')').trim)).map((t: (char, int, char)) => t[1])
   let primary = (number / parens).named("primary")
@@ -22,7 +22,7 @@ proc calculator(): Parser[int] =
 template agree(p: untyped, inputs: openArray[string]) =
   for input in inputs:
     let slow = p.parse(input)
-    let fast = p.fastParseOn(Context(input: newInput(input)))
+    let fast = p.fastParseOn(Context[string](input: newInput(input)))
     check (if slow.isSuccess: slow.pos else: -1) == fast
 
 suite "leaves":
@@ -32,7 +32,7 @@ suite "leaves":
     check not pattern("^0-9").parse("5").isSuccess
     check str("let").parse("let x").value == "let"
     check not str("let").parse("le").isSuccess
-    check endOfInput().parse("").isSuccess
+    check endOfInput[string]().parse("").isSuccess
     check noneOf("ab", "not a or b").parse("c").value == 'c'
     check between('a', 'f').parse("d").value == 'd'
     check word().plus.flatten.parse("ab_1 x").value == "ab_1"
@@ -43,11 +43,11 @@ suite "leaves":
     check not strIgnoreCase("select").parse("selec").isSuccess
     check newline().parse("\r\nx").pos == 2 and newline().parse("\nx").pos == 1
     check not newline().parse("x").isSuccess
-    check epsilon().parse("x").pos == 0
-    check epsilon(7).parse("").value == 7
-    check not failure[int]("nope").parse("x").isSuccess
-    check failure[int]("nope").parse("x").message == "expected nope at 1:1"
-    check (ch('a') & position()).parse("ab").value == ('a', 1)
+    check epsilon[string]().parse("x").pos == 0
+    check epsilon[string, int](7).parse("").value == 7
+    check not failure[string, int]("nope").parse("x").isSuccess
+    check failure[string, int]("nope").parse("x").message == "expected nope at 1:1"
+    check (ch('a') & position[string]()).parse("ab").value == ('a', 1)
 
   test "a failed result has no value":
     expect ParseError:
@@ -128,7 +128,7 @@ suite "combinators":
     check comment.parse("/* a * b */x").value[1] == " a * b "
     check not neg(ch('x')).parse("").isSuccess
     check neg(ch('x')).parse("x").message == "expected not 'x' at 1:1"
-    check neg(ch(0xFF'u8), byte).star.parse([1'u8, 2, 0xFF]).value == @[1'u8, 2]
+    check neg(ch(0xFF'u8)).star.parse([1'u8, 2, 0xFF]).value == @[1'u8, 2]
     agree neg(str("*/")).star, ["a*/", "*/", "ab", "", "*"]
 
   test "where filters with its own expectation":
@@ -141,7 +141,7 @@ suite "combinators":
 
   test "callCC wraps a delegate":
     var calls = 0
-    let traced = digit().callCC(proc (next: Parser[char], ctx: Context): Result[char] =
+    let traced = digit().callCC(proc (next: TextParser[char], ctx: Context[string]): Result[char] =
       inc calls
       next.parseOn(ctx))
     check traced.plus.parse("12x").value == @['1', '2']
@@ -177,7 +177,7 @@ suite "recursion and resolve":
   test "resolve removes every forward reference and keeps cycles":
     let calc = calculator()
     for n in calc.allParsers:
-      check not (n of SettableParser[int])
+      check not (n of SettableParser[string, int])
     # still cyclic: a child of `primary` leads back to `primary`
     let primary = block:
       var found: ParserBase
@@ -191,7 +191,7 @@ suite "recursion and resolve":
     check calc.parse("((((7))))").value == 7
 
   test "an undefined reference fails as itself":
-    let p = (undefined[int]("missing") & ch('a')).resolve
+    let p = (undefined[string, int]("missing") & ch('a')).resolve
     check p.parse("a").message == "expected missing at 1:1"
     check not p.accepts("a")
 
@@ -201,7 +201,7 @@ suite "bytes":
     let r = frame.parse([0xA0'u8, 0x41, 0x42, 0xFF])
     check r.isSuccess and r.value[0] == 0xA0'u8 and r.value[1] == @[0x41'u8, 0x42]
     check not frame.parse([0xA0'u8, 0x80, 0xFF]).isSuccess
-    check anyByte().star.flatten.parse([0x00'u8, 0xFF]).value == "\x00\xFF"
+    check anyByte().star.flatten.parse([0x00'u8, 0xFF]).value == @[0x00'u8, 0xFF]
     check frame.accepts([0xA0'u8, 0xFF])
 
 suite "errors":

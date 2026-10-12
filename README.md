@@ -30,7 +30,7 @@ echo p.parse(src) # does the thing
 
 ## Grammars
 
-There are currently two grammars available via `import petit_parser/grammar/<a-grammar>`.
+Two grammars come with the library, via `import petit_parser/grammar/<a-grammar>`.
 
 - `json`
 
@@ -42,62 +42,28 @@ as strings and decodes unicode strings.
   Implements an extremely naiive sexp grammar with the atoms, strings, 
 lists, quoting, and `;` comments.
 
-- `bassline_text`
-
-  Reads the bassline textual syntax into a light tree. Numbers are kept
-as spelled, bytes as bytes, and text is decoded. `basslineParser` reads one value
-and `basslineDocument` reads any number of them. The tests run the
-shared bassline corpus against it.
-
-- `bassline_ce`
-
-  Reads bassline's canonical binary encoding into the same tree, without
-validating it. Lengths are taken as stated and integers, utf-8, order
-and duplicates are not checked. `ceParser` reads one value and
-`ceDocument` reads a `.blb` file. The tests decode the corpus and check
-it against the text.
-
-- `extended_bassline_text`
-
-  The text syntax with dialect blocks. `lang NAME [[ … ]]` reads the
-block with the parser registered as NAME and puts its value where the
-block stands, so another notation can be written inside bassline text
-and still read as values. `extendedParser(dialects)` and
-`extendedDocument(dialects)` take a `Dialects` table of name to
-`Parser[BlNode]`. `standardDialects()` holds `sexp` and `json`.
-
-  ```nim
-  var dialects = standardDialects()
-  dialects["words"] = word().plus.flatten("word").map(sym).trim.star.map(list)
-  let p = extendedParser(dialects)
-  echo p.parse("(q lang words [[ hello world ]] lang json [[ {\"a\": [1, 2]} ]])").value
-  ```
-
-  The block is a Lua long bracket. `[=[ … ]=]` at any level of `=` holds
-content with `]]` in it, and a block inside a block needs a higher
-level. `lang` is reserved, so the symbol has to be written `'lang'`. A
-mark after the block, `lang sexp [[ a ]]!`, marks its value.
-
-  A dialect is any `Parser[BlNode]`. It runs on the document itself with
-the input cut at the closing bracket, so `endOfInput` matches there, a
-failure inside reports its position in the document, and a dialect that
-stops short fails with `the end of the block`. Resolve a dialect before
-registering it. The parser also runs at compile time, so a document with
-blocks can be read into a constant.
+The bassline grammars, the text syntax, the canonical encoding, the
+dialect blocks and references, live in the bassline repository under
+`packages/blnim/src/bl/grammar`, built on this library.
 
 ## Using the parsers
 
-A parser is a value. Combining parsers gives you a new parser. Call
-`p.parse(text)` to get a `Result`. It has `isSuccess`, `value`, `pos` and
-`message`. Reading `value` on a failed result raises `ParseError`.
-`p.accepts(text)` only checks that the input matches and builds nothing.
-Both take a `string` or an `openArray[byte]`.
+A parser is a value. Combining parsers gives you a new parser. A parser
+reads one kind of source: `Parser[S, R]` reads an `S`, anything with
+`len` and `[]`, and answers an `R`. `TextParser[R]` is `Parser[string, R]`
+and `ByteParser[R]` is `Parser[seq[byte], R]`. Call `p.parse(source)` to
+get a `Result`. It has `isSuccess`, `value`, `pos` and `message`. Reading
+`value` on a failed result raises `ParseError`. `p.accepts(source)` only
+checks that the input matches and builds nothing. A text parser takes a
+`string`, a byte parser a `seq[byte]` or an `openArray[byte]`, and a
+message prints its position as line:column for text and as an offset
+for bytes.
 
 Finish a document parser with `complete`. Without it a parser that
 matches a prefix of the input succeeds and the rest is ignored.
 
 ```nim
-let r = (digit().plus & endOfInput()).parse("12x")
+let r = (digit().plus & endOfInput[string]()).parse("12x")
 if not r.isSuccess: echo r.message   # expected one of digit, end of input at 1:3
 ```
 
@@ -117,6 +83,11 @@ The `expected` argument is the name used in error messages, so use the
 name of the thing the grammar wants ("digit", "sign") rather than a
 description of the characters. Every call makes a new parser node.
 
+These live in the `text` and `bytes` modules. Over any other source, a
+sequence of values say, `item[S](pred, "expected")` takes one element
+where `pred` holds, `oneOf[S, E](set, "expected")` one from a set, and
+`any[S]()` any one. The character leaves are `oneOf` over `string`.
+
 ### Literals and markers
 
 | Parser | Returns |
@@ -124,10 +95,13 @@ description of the characters. Every call makes a new parser node.
 | `str("let")`, `str([0xFF'u8])` | the literal |
 | `strIgnoreCase("select")` | the input as written |
 | `newline()` | `\r\n`, `\n` or `\r` |
-| `endOfInput()` | `Nothing`, and only matches at the end |
-| `epsilon()`, `epsilon(value)` | consumes nothing and always succeeds |
-| `failure[R]("expected …")` | always fails |
-| `position()` | the current position, consumes nothing |
+| `endOfInput[S]()` | `Nothing`, and only matches at the end |
+| `epsilon[S]()`, `epsilon[S, T](value)` | consumes nothing and always succeeds |
+| `failure[S, R]("expected …")` | always fails |
+| `position[S]()` | the current position, consumes nothing |
+
+The last four have no parser to take the source from, so they name it,
+`endOfInput[string]()`. `complete` adds the end of input for you.
 
 ### Sequence and choice
 
@@ -173,8 +147,8 @@ value. `pick(i)` takes one value out of a tuple without copying it, so
 prefer it to `map(t => t[i])`, and `elements` does the same for a
 separated list.
 
-`flatten` returns the text that `p` consumed as a string and does not
-build any of `p`'s values. `flatten("number")` gives it a name for
+`flatten` returns the stretch of source that `p` consumed, a string for
+text and a `seq[byte]` for bytes, and does not build any of `p`'s values. `flatten("number")` gives it a name for
 messages. Use it instead of `plus` and `join` for runs of characters.
 Since `p` only runs as a recogniser, a failure inside it is reported as
 this node's failure, at the position where it started.
@@ -191,8 +165,8 @@ furthest failure and shows in the message.
 `optional` returns an `Option`. `optional(p, default)` returns `R` and
 uses `default` when `p` does not match.
 
-`trim()` skips whitespace on both sides. `trim(ws)` and `trim(left,
-right)` take any recogniser and apply it as many times as it matches, so
+`trim()` skips whitespace on both sides of a text parser. `trim(ws)` and
+`trim(left, right)` take any recogniser and apply it as many times as it matches, so
 `trim(whitespace().skip / comment)` skips comments as well.
 
 ### Lookahead
@@ -202,8 +176,8 @@ right)` take any recogniser and apply it as many times as it matches, so
 `notAhead(p)` succeeds with `Nothing` where `p` does not match.
 
 `neg(p)` is "anything but `p`". It fails if `p` matches and otherwise
-consumes one character and returns it. `neg(p, byte)` does the same for
-a byte. `neg(ch('"')).star.flatten` reads a string body.
+consumes one element, a character or a byte as the source has, and
+returns it. `neg(ch('"')).star.flatten` reads a string body.
 
 ### Recursion
 
@@ -217,7 +191,7 @@ debug build Nim's own call depth limit of 2000 calls is hit first, at
 about 200 levels of the bassline grammar.
 
 ```nim
-let value = undefined[int]("value")
+let value = undefined[string, int]("value")
 let parens = delimited(ch('('), ch(')'), value)
 value.define(digit().map(c => ord(c) - ord('0')) / parens)
 let grammar = value.complete.resolve
@@ -246,7 +220,7 @@ Groups go from the tightest binding to the loosest. `wrapper` is for
 parentheses and `left` and `right` set the associativity.
 
 ```nim
-let b = newExpressionBuilder[int]()
+let b = newExpressionBuilder[string, int]()
 b.primitive(digit().plus.flatten.trim.map(s => parseInt(s)))
 b.group.wrapper(ch('(').trim, ch(')').trim, (l: char, v: int, r: char) => v)
 b.group.prefix(ch('-').trim, (op: char, a: int) => -a)
@@ -261,11 +235,17 @@ let calc = b.build.complete
 `callCC(handler)` gives `handler` the delegate parser along with the
 current `Context`. The handler can run it with `parseOn`, skip it, run
 it somewhere else or run it more than once. This is how you write
-tracing, profiling, memoisation and dispatch on what was just read. `succeed(value, pos)` and `fail[R](node, ctx)` build results
-and `failedAs(T, r)` carries a failure over to another result type. A
+tracing, profiling, memoisation and dispatch on what was just read.
+`succeed(value, pos)` and `fail[S, R](node, ctx)` build results and
+`failedAs(T, r)` carries a failure over to another result type. A
 handler may set `Input.stop` to make the rest of the input end early for
-a delegate, which is how dialect blocks are read. `children`, `replace`
-and `allParsers` are the graph protocol that `resolve` is built on.
+a delegate, which is how dialect blocks are read, or open a
+`child(parent, at, source)` input over part of what it read, a frame's
+body say; failures in a child count toward the furthest failure in
+document order and print as a path, `2.0.3`. `leaf[S, R](expected, step,
+value)` is how a new leaf is written, from its fast path and its reader.
+`children`, `replace` and `allParsers` are the graph protocol that
+`resolve` is built on.
 
 ### How it runs
 

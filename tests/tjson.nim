@@ -53,4 +53,4 @@ suite "json":
     for input in ["[1, {\"a\": [true]}]", "[1,]", " null ", "\"\\u12\""]:
       check p.accepts(input) == p.parse(input).isSuccess
     for n in p.allParsers:
-      check not (n of SettableParser[JsonValue])
+      check not (n of SettableParser[string, JsonValue])

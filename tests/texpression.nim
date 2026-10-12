@@ -1,8 +1,8 @@
 import std/[math, strutils, sugar, unittest]
 import petit_parser
 
-proc arith(): Parser[int] =
-  let b = newExpressionBuilder[int]()
+proc arith(): TextParser[int] =
+  let b = newExpressionBuilder[string, int]()
   b.primitive(digit().plus.flatten("number").trim.map((s: string) => parseInt(s)))
   b.group.wrapper(ch('(').trim, ch(')').trim, (l: char, v: int, r: char) => v)
   b.group.prefix(ch('-').trim, (op: char, a: int) => -a)
@@ -33,7 +33,7 @@ suite "expression builder":
     for input in ["1+(2", "1 +", "(3)!", "2^", ""]:
       check p.accepts(input) == p.parse(input).isSuccess
     for n in p.allParsers:
-      check not (n of SettableParser[int])
+      check not (n of SettableParser[string, int])
 
   test "failures name the operands expected":
     let m = p.parse("1 +").message

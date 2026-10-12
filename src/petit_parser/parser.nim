@@ -1,13 +1,18 @@
-## A PetitParser port, after the Dart version. A node's behaviour is a set
-## of closures over its own state, so the graph protocol (`children`,
-## `replace`, `fastParseOn`) is untyped and only `parseOn` knows the result
-## type. Two parse paths: `parseOn` builds values; `fastParseOn` only
-## recognises, answering the new position or -1, and allocates nothing
-## (greedy repetition excepted: it keeps the positions it may back up to).
-## One `Input` per parse keeps the furthest failure and every node that
-## failed there, for "expected one of" errors.
+## A PetitParser port, after the Dart version, over any source with `len`
+## and `[]`: text, bytes, or a sequence of values. A node's behaviour is a
+## set of closures over its own state, so the graph protocol (`children`,
+## `replace`) is untyped, `fastParseOn` knows the source and only
+## `parseOn` knows the result type. Two parse paths: `parseOn` builds
+## values; `fastParseOn` only recognises, answering the new position or -1,
+## and allocates nothing (greedy repetition excepted: it keeps the positions
+## it may back up to). One `Run` per parse keeps the furthest failure and
+## every node that failed there, for "expected one of" errors, across every
+## input the parse opens.
+##
+## Only leaves know the source. The ones here work for any source; `text`
+## and `bytes` add the ones that read characters and bytes.
 
-import std/[options, sets, hashes, strutils, setutils, macros, sugar]
+import std/[options, sets, hashes, strutils, macros, sugar]
 export options
 
 const MaxDepth* {.intdefine.} = 1000
@@ -15,15 +20,25 @@ const MaxDepth* {.intdefine.} = 1000
   ## once resolved, counts one level each time it is entered.
 
 type
-  Input* = ref object
-    text*: string
-    stop*: int
+  Run* = ref object
+    ## One parse: the furthest failure, and how deep the references are.
+    input*: InputBase
+    pos*: int
+    nodes*: seq[ParserBase]
     depth*: int
-    furthestPos*: int
-    furthestNodes*: seq[ParserBase]
 
-  Context* = object
-    input*: Input
+  InputBase* = ref object of RootObj
+    stop*: int                   ## where reading ends: the length, or a block's end
+    parent*: InputBase           ## the input this one was entered from, if any
+    at*: int                     ## and where
+    run*: Run
+    locateFn*: (int) -> string   ## how a position prints; nil for the default
+
+  Input*[S] = ref object of InputBase
+    source*: S
+
+  Context*[S] = object
+    input*: Input[S]
     pos*: int
 
   ParseError* = object of CatchableError
@@ -33,11 +48,13 @@ type
     isRef: bool
     childrenFn: () -> seq[ParserBase]
     replaceFn: (ParserBase, ParserBase) -> void
-    fastFn: (Context) -> int
     nestFn: (ParserBase) -> ParserBase   ## a placeholder's counting stand-in
 
-  Parser*[R] = ref object of ParserBase
-    parseFn: (Context) -> Result[R]
+  SourceParser*[S] = ref object of ParserBase
+    fastFn: (Context[S]) -> int
+
+  Parser*[S, R] = ref object of SourceParser[S]
+    parseFn: (Context[S]) -> Result[R]
 
   Result*[R] = object
     pos*: int
@@ -45,13 +62,13 @@ type
     of true: val: R
     of false:
       failed*: ParserBase
-      input*: Input          ## set by `parse`, so `message` can explain
+      input*: InputBase        ## set by `parse`, so `message` can explain
 
   Nothing* = object
 
   Token*[R] = object
     value*: R
-    input*: Input
+    input*: InputBase
     start*, stop*: int
 
   Separated*[R, S] = object
@@ -71,20 +88,41 @@ proc take*[R](r: var Result[R]): R =
   else:
     raise newException(ParseError, "tried to take the value of a failed result")
 
-proc lineCol*(text: string, pos: int): (int, int) =
-  let before = text[0 ..< min(pos, text.len)]
-  (before.count('\n') + 1, pos - before.rfind('\n'))
+# ---------------------------------------------------------------------------
+# Inputs and where a position is
+
+proc newInput*[S](source: sink S): Input[S] =
+  result = Input[S](source: source, run: Run())
+  result.stop = result.source.len
+
+proc child*[S](parent: InputBase, at: int, source: sink S): Input[S] =
+  ## A source entered from `parent` at `at`: a frame's body, a block. It
+  ## shares the parent's run, so failures inside it count toward the
+  ## furthest.
+  result = Input[S](source: source, run: parent.run, parent: parent, at: at)
+  result.stop = result.source.len
+
+proc place(input: InputBase, pos: int): seq[int] =
+  ## The path to `pos` from the root input, outermost first.
+  result = @[pos]
+  var i = input
+  while not i.parent.isNil:
+    result.insert(i.at, 0)
+    i = i.parent
+
+proc locate*(input: InputBase, pos: int): string =
+  if not input.locateFn.isNil: input.locateFn(pos)
+  elif input.parent.isNil: $pos
+  else: input.place(pos).join(".")
 
 proc message*[R](r: Result[R]): string =
   if r.isSuccess:
     raise newException(ParseError, "tried to read the message of a successful result")
   var expected: seq[string]
-  for n in (if r.input.isNil: @[r.failed] else: r.input.furthestNodes):
+  let nodes = if r.input.isNil: @[r.failed] else: r.input.run.nodes
+  for n in nodes:
     if n.expected notin expected: expected.add n.expected
-  var where = $r.pos
-  if not r.input.isNil:
-    let (line, col) = lineCol(r.input.text, r.pos)
-    where = $line & ":" & $col
+  let where = if r.input.isNil: $r.pos else: r.input.run.input.locate(r.input.run.pos)
   let what = if expected.len == 1: expected[0] else: "one of " & expected.join(", ")
   "expected " & what & " at " & where
 
@@ -93,24 +131,36 @@ proc message*[R](r: Result[R]): string =
 
 proc hash*(p: ParserBase): Hash = hash(cast[pointer](p))
 
-proc newInput*(text: sink string): Input =
-  result = Input(text: text)
-  result.stop = result.text.len
-
-template at*(ctx: Context, newPos: int): Context =
-  Context(input: ctx.input, pos: newPos)
+template at*(ctx: Context, newPos: int): untyped =
+  Context[typeof(ctx.input.source)](input: ctx.input, pos: newPos)
 
 proc succeed*[R](value: sink R, pos: int): Result[R] {.inline.} =
   Result[R](isSuccess: true, val: value, pos: pos)
 
-proc record(input: Input, node: ParserBase, pos: int) =
-  if pos > input.furthestPos:
-    input.furthestPos = pos
-    input.furthestNodes.setLen 0
-  if pos == input.furthestPos and node notin input.furthestNodes:
-    input.furthestNodes.add node
+proc afterwards(a, b: seq[int]): bool =
+  ## Is path `a` later than `b` in document order? A longer path with an
+  ## equal prefix is later: inside a frame comes after the frame.
+  for i in 0 ..< min(a.len, b.len):
+    if a[i] != b[i]: return a[i] > b[i]
+  a.len > b.len
 
-proc fail*[R](node: ParserBase, ctx: Context): Result[R] =
+proc later(input: InputBase, pos: int, run: Run): bool {.inline.} =
+  ## Is (`input`, `pos`) further on in document order than the run's
+  ## furthest failure?
+  if run.input.isNil: return true
+  if input == run.input: return pos > run.pos
+  input.place(pos).afterwards(run.input.place(run.pos))
+
+proc record(input: InputBase, node: ParserBase, pos: int) {.inline.} =
+  let run = input.run
+  if input.later(pos, run):
+    run.input = input
+    run.pos = pos
+    run.nodes.setLen 0
+  if input == run.input and pos == run.pos and node notin run.nodes:
+    run.nodes.add node
+
+proc fail*[S, R](node: ParserBase, ctx: Context[S]): Result[R] =
   ## A failure of `node` where `ctx` stands, remembered for the message.
   ctx.input.record(node, ctx.pos)
   Result[R](isSuccess: false, failed: node, pos: ctx.pos)
@@ -119,8 +169,8 @@ template failedAs*(T: typedesc, r: untyped): untyped =
   ## `r`'s failure as a `Result[T]`, for a handler answering another type.
   Result[T](isSuccess: false, failed: r.failed, pos: r.pos)
 
-proc parseOn*[R](p: Parser[R], ctx: Context): Result[R] {.inline.} = p.parseFn(ctx)
-proc fastParseOn*(p: ParserBase, ctx: Context): int {.inline.} = p.fastFn(ctx)
+proc parseOn*[S, R](p: Parser[S, R], ctx: Context[S]): Result[R] {.inline.} = p.parseFn(ctx)
+proc fastParseOn*[S](p: SourceParser[S], ctx: Context[S]): int {.inline.} = p.fastFn(ctx)
 
 proc children*(p: ParserBase): seq[ParserBase] =
   if not p.childrenFn.isNil: result = p.childrenFn()
@@ -133,7 +183,7 @@ proc kids(ps: varargs[ParserBase]): seq[ParserBase] = @ps
 
 template swapIn(field, source, target: untyped) =
   if same(field, source):
-    when typeof(field) is Parser: field = typeof(field)(target)
+    when typeof(field) is Parser or typeof(field) is SourceParser: field = typeof(field)(target)
     else: field = target
 
 template over(node, child: untyped) =
@@ -147,15 +197,16 @@ template overBoth(node, a, b: untyped) =
     swapIn(a, source, target)
     swapIn(b, source, target)
 
-proc recognising[R](p: Parser[R]): (Context) -> int =
+proc recognising[S, R](p: Parser[S, R]): (Context[S]) -> int =
   ## The fast path of a node whose value decides whether it matches.
-  proc (ctx: Context): int =
+  proc (ctx: Context[S]): int =
     let r = p.parseOn(ctx)
     if r.isSuccess: r.pos else: -1
 
-proc resultTypeOf[R](p: Parser[R]): R = discard
+proc sourceTypeOf[S, R](p: Parser[S, R]): S = discard
+proc resultTypeOf[S, R](p: Parser[S, R]): R = discard
 
-proc named*[R](p: Parser[R], name: string): Parser[R] =
+proc named*[S, R](p: Parser[S, R], name: string): Parser[S, R] =
   p.name = name
   p.expected = name
   p
@@ -163,104 +214,56 @@ proc named*[R](p: Parser[R], name: string): Parser[R] =
 # ---------------------------------------------------------------------------
 # Leaves: a recogniser and how to read what it matched
 
-proc leaf[R](expected: string, step: (Context) -> int, value: (Context, int) -> R): Parser[R] =
-  let p = Parser[R](expected: expected, fastFn: step)
-  p.parseFn = proc (ctx: Context): Result[R] =
+proc leaf*[S, R](expected: string, step: (Context[S]) -> int,
+                 value: (Context[S], int) -> R): Parser[S, R] =
+  ## A node from its two paths: `step` answers the position after a match
+  ## or -1, `value` reads the match that ended at `stop`.
+  let p = Parser[S, R](expected: expected, fastFn: step)
+  p.parseFn = proc (ctx: Context[S]): Result[R] =
     let stop = step(ctx)
-    if stop < 0: fail[R](p, ctx) else: succeed(value(ctx, stop), stop)
+    if stop < 0: fail[S, R](p, ctx) else: succeed(value(ctx, stop), stop)
   p
 
-proc one[E: char | byte](es: set[E], expected: string): Parser[E] =
-  leaf[E](expected,
-    (ctx: Context) => (if ctx.pos < ctx.input.stop and
-                          E(ctx.input.text[ctx.pos]) in es: ctx.pos + 1 else: -1),
-    (ctx: Context, stop: int) => E(ctx.input.text[ctx.pos]))
+proc item*[S](pred: (typeof(default(S)[0])) -> bool,
+              expected: string): Parser[S, typeof(default(S)[0])] =
+  ## One element of the source where `pred` holds.
+  leaf[S, typeof(default(S)[0])](expected,
+    (ctx: Context[S]) => (if ctx.pos < ctx.input.stop and pred(ctx.input.source[ctx.pos]): ctx.pos + 1
+                          else: -1),
+    (ctx: Context[S], stop: int) => ctx.input.source[ctx.pos])
 
-proc chars*(cs: set[char], expected: string): Parser[char] = one(cs, expected)
-proc chars*(cs, expected: string): Parser[char] = one(cs.toSet, expected)
-proc noneOf*(cs, expected: string): Parser[char] = one(cs.toSet.complement, expected)
-proc bytes*(bs: set[byte], expected: string): Parser[byte] = one(bs, expected)
-proc ch*(c: char): Parser[char] = one({c}, "'" & c & "'")
-proc ch*(b: byte): Parser[byte] = one({b}, "0x" & b.toHex)
-proc between*(lo, hi: char): Parser[char] = one({lo .. hi}, "'" & lo & "'..'" & hi & "'")
+proc oneOf*[S, E](es: set[E], expected: string): Parser[S, E] =
+  ## One element of the source from a set, for sources of ordinals.
+  leaf[S, E](expected,
+    (ctx: Context[S]) => (if ctx.pos < ctx.input.stop and ctx.input.source[ctx.pos] in es: ctx.pos + 1
+                          else: -1),
+    (ctx: Context[S], stop: int) => ctx.input.source[ctx.pos])
 
-proc pattern*(spec: string): Parser[char] =
-  ## A character class: "a-zA-Z_", or negated "^0-9".
-  let negated = spec.startsWith '^'
-  var
-    cs: set[char]
-    i = negated.ord
-  while i < spec.len:
-    if i + 2 < spec.len and spec[i + 1] == '-':
-      cs.incl {spec[i] .. spec[i + 2]}
-      i += 3
-    else:
-      cs.incl spec[i]
-      inc i
-  chars(if negated: cs.complement else: cs, "[" & spec & "]")
+proc any*[S](): Parser[S, typeof(default(S)[0])] =
+  ## Any one element.
+  leaf[S, typeof(default(S)[0])]("any element",
+    (ctx: Context[S]) => (if ctx.pos < ctx.input.stop: ctx.pos + 1 else: -1),
+    (ctx: Context[S], stop: int) => ctx.input.source[ctx.pos])
 
-proc anyChar*(): Parser[char] = chars(fullSet(char), "any character")
-proc anyByte*(): Parser[byte] = bytes(fullSet(byte), "any byte")
-proc digit*(): Parser[char] = chars(Digits, "digit")
-proc letter*(): Parser[char] = chars(Letters, "letter")
-proc lowercase*(): Parser[char] = chars({'a' .. 'z'}, "lowercase letter")
-proc uppercase*(): Parser[char] = chars({'A' .. 'Z'}, "uppercase letter")
-proc word*(): Parser[char] = chars(Letters + Digits + {'_'}, "letter or digit")
-proc whitespace*(): Parser[char] = chars(Whitespace, "whitespace")
+proc endOfInput*[S](): Parser[S, Nothing] =
+  leaf[S, Nothing]("end of input",
+    (ctx: Context[S]) => (if ctx.pos >= ctx.input.stop: ctx.pos else: -1),
+    (ctx: Context[S], stop: int) => Nothing())
 
-proc toText(data: openArray[byte]): string =
-  result = newString(data.len)
-  for i, b in data: result[i] = b.char
-
-proc continuesWith(ctx: Context, lit: string): bool =
-  ctx.pos + lit.len <= ctx.input.stop and ctx.input.text.continuesWith(lit, ctx.pos)
-
-proc str*(lit: string): Parser[string] =
-  leaf[string]("'" & lit & "'",
-    (ctx: Context) => (if ctx.continuesWith(lit): ctx.pos + lit.len else: -1),
-    (ctx: Context, stop: int) => lit)
-
-proc str*(lit: openArray[byte]): Parser[string] = str(lit.toText)
-
-proc continuesWithIgnoreCase(ctx: Context, lit: string): bool =
-  if ctx.pos + lit.len > ctx.input.stop: return false
-  for i, c in lit:
-    if ctx.input.text[ctx.pos + i].toLowerAscii != c.toLowerAscii: return false
-  true
-
-proc strIgnoreCase*(lit: string): Parser[string] =
-  ## `lit` in any ASCII case; the value is the input as written.
-  leaf[string]("'" & lit & "'",
-    (ctx: Context) => (if ctx.continuesWithIgnoreCase(lit): ctx.pos + lit.len else: -1),
-    (ctx: Context, stop: int) => ctx.input.text[ctx.pos ..< stop])
-
-proc newline*(): Parser[string] =
-  leaf[string]("newline",
-    proc (ctx: Context): int =
-      if ctx.continuesWith("\r\n"): ctx.pos + 2
-      elif ctx.pos < ctx.input.stop and ctx.input.text[ctx.pos] in {'\n', '\r'}: ctx.pos + 1
-      else: -1,
-    (ctx: Context, stop: int) => ctx.input.text[ctx.pos ..< stop])
-
-proc endOfInput*(): Parser[Nothing] =
-  leaf[Nothing]("end of input",
-    (ctx: Context) => (if ctx.pos >= ctx.input.stop: ctx.pos else: -1),
-    (ctx: Context, stop: int) => Nothing())
-
-proc epsilon*(): Parser[Nothing] =
+proc epsilon*[S](): Parser[S, Nothing] =
   ## Matches nothing, always.
-  leaf[Nothing]("nothing", (ctx: Context) => ctx.pos, (ctx: Context, stop: int) => Nothing())
+  leaf[S, Nothing]("nothing", (ctx: Context[S]) => ctx.pos, (ctx: Context[S], stop: int) => Nothing())
 
-proc epsilon*[T](value: T): Parser[T] =
-  leaf[T]("nothing", (ctx: Context) => ctx.pos, (ctx: Context, stop: int) => value)
+proc epsilon*[S, T](value: T): Parser[S, T] =
+  leaf[S, T]("nothing", (ctx: Context[S]) => ctx.pos, (ctx: Context[S], stop: int) => value)
 
-proc failure*[R](expected: string): Parser[R] =
+proc failure*[S, R](expected: string): Parser[S, R] =
   ## Fails, always, expecting `expected`.
-  leaf[R](expected, (ctx: Context) => -1, (ctx: Context, stop: int) => default(R))
+  leaf[S, R](expected, (ctx: Context[S]) => -1, (ctx: Context[S], stop: int) => default(R))
 
-proc position*(): Parser[int] =
+proc position*[S](): Parser[S, int] =
   ## The position reached, consuming nothing.
-  leaf[int]("position", (ctx: Context) => ctx.pos, (ctx: Context, stop: int) => ctx.pos)
+  leaf[S, int]("position", (ctx: Context[S]) => ctx.pos, (ctx: Context[S], stop: int) => ctx.pos)
 
 # ---------------------------------------------------------------------------
 # Sequence: a tuple of parsers answers the tuple of their values
@@ -271,9 +274,11 @@ macro sequence*(parsers: tuple): untyped =
     given = genSym(nskLet, "given")
     ps = genSym(nskVar, "parsers")
     node = genSym(nskLet, "node")
+    S = genSym(nskType, "S")
     R = genSym(nskType, "R")
     (pos, ctx) = (ident"pos", ident"ctx")
     (source, target) = (ident"source", ident"target")
+    first = nnkBracketExpr.newTree(given, newLit 0)
   var
     slots = nnkTupleConstr.newTree()
     takes = newStmtList()
@@ -290,7 +295,7 @@ macro sequence*(parsers: tuple): untyped =
       q = nnkBracketExpr.newTree(ps, newLit i)
       r = ident("r" & $i)
       t = newCall(bindSym"resultTypeOf", g)
-    slots.add nnkBracketExpr.newTree(bindSym"Parser", newCall(bindSym"typeof", t))
+    slots.add nnkBracketExpr.newTree(bindSym"Parser", S, newCall(bindSym"typeof", t))
     takes.add quote do: `q` = `g`
     types.add t
     values.add newCall(ident"move", newDotExpr(r, ident"val"))
@@ -306,15 +311,16 @@ macro sequence*(parsers: tuple): untyped =
     swaps.add quote do: swapIn(`q`, `source`, `target`)
   quote do:
     let `given` = `parsers`
+    type `S` = typeof(sourceTypeOf(`first`))
     var `ps`: `slots`
     `takes`
     type `R` = typeof(`types`)
-    let `node` = Parser[`R`](expected: `names`.join(" then "))
-    `node`.parseFn = proc (`ctx`: Context): Result[`R`] =
+    let `node` = Parser[`S`, `R`](expected: `names`.join(" then "))
+    `node`.parseFn = proc (`ctx`: Context[`S`]): Result[`R`] =
       var `pos` = `ctx`.pos
       `parse`
       succeed(`values`, `pos`)
-    `node`.fastFn = proc (`ctx`: Context): int =
+    `node`.fastFn = proc (`ctx`: Context[`S`]): int =
       var `pos` = `ctx`.pos
       `fast`
       `pos`
@@ -322,31 +328,31 @@ macro sequence*(parsers: tuple): untyped =
     `node`.replaceFn = proc (`source`, `target`: ParserBase) = `swaps`
     `node`
 
-proc `&`*[A, B](a: Parser[A], b: Parser[B]): Parser[(A, B)] = sequence((a, b))
+proc `&`*[S, A, B](a: Parser[S, A], b: Parser[S, B]): Parser[S, (A, B)] = sequence((a, b))
 
 # ---------------------------------------------------------------------------
 # Ordered choice: the first alternative that succeeds
 
-type ChoiceParser*[R] = ref object of Parser[R]
-  alts: seq[Parser[R]]
+type ChoiceParser*[S, R] = ref object of Parser[S, R]
+  alts: seq[Parser[S, R]]
 
-proc oneOf(names: seq[string]): string =
+proc alternatives(names: seq[string]): string =
   case names.len
   of 0: "no alternative"
   of 1: names[0]
   else: "one of " & names.join(", ")
 
-proc choice*[R](alts: varargs[Parser[R]]): Parser[R] =
+proc choice*[S, R](alts: varargs[Parser[S, R]]): Parser[S, R] =
   var names: seq[string]
   for a in alts:
     if a.expected notin names: names.add a.expected
-  let c = ChoiceParser[R](alts: @alts, expected: names.oneOf)
-  c.parseFn = proc (ctx: Context): Result[R] =
+  let c = ChoiceParser[S, R](alts: @alts, expected: names.alternatives)
+  c.parseFn = proc (ctx: Context[S]): Result[R] =
     for alt in c.alts:
       result = alt.parseOn(ctx)
       if result.isSuccess: return
-    if c.alts.len == 0: result = fail[R](c, ctx)
-  c.fastFn = proc (ctx: Context): int =
+    if c.alts.len == 0: result = fail[S, R](c, ctx)
+  c.fastFn = proc (ctx: Context[S]): int =
     for alt in c.alts:
       let pos = alt.fastParseOn(ctx)
       if pos >= 0: return pos
@@ -357,11 +363,11 @@ proc choice*[R](alts: varargs[Parser[R]]): Parser[R] =
     for alt in c.alts.mitems: swapIn(alt, source, target)
   c
 
-proc `/`*[R](a, b: Parser[R]): Parser[R] =
+proc `/`*[S, R](a, b: Parser[S, R]): Parser[S, R] =
   ## `a / b / c` is one flat choice; a named choice stays a unit.
-  var alts: seq[Parser[R]]
+  var alts: seq[Parser[S, R]]
   for x in [a, b]:
-    if x of ChoiceParser[R] and x.name.len == 0: alts.add ChoiceParser[R](x).alts
+    if x of ChoiceParser[S, R] and x.name.len == 0: alts.add ChoiceParser[S, R](x).alts
     else: alts.add x
   choice(alts)
 
@@ -369,12 +375,12 @@ proc `/`*[R](a, b: Parser[R]): Parser[R] =
 # Repetition. `max` < 0 is unbounded. An item that consumes nothing ends
 # the run once `min` is met, so a nullable item cannot loop.
 
-proc repeat*[R](item: Parser[R], min: int, max = -1): Parser[seq[R]] =
+proc repeat*[S, R](item: Parser[S, R], min: int, max = -1): Parser[S, seq[R]] =
   ## Possessive: as many items as match, never giving input back.
   assert max < 0 or min <= max
   var item = item
-  let p = Parser[seq[R]](expected: item.expected)
-  p.parseFn = proc (ctx: Context): Result[seq[R]] =
+  let p = Parser[S, seq[R]](expected: item.expected)
+  p.parseFn = proc (ctx: Context[S]): Result[seq[R]] =
     var
       values: seq[R]
       pos = ctx.pos
@@ -387,7 +393,7 @@ proc repeat*[R](item: Parser[R], min: int, max = -1): Parser[seq[R]] =
       values.add move(r.val)
       pos = r.pos
     succeed(values, pos)
-  p.fastFn = proc (ctx: Context): int =
+  p.fastFn = proc (ctx: Context[S]): int =
     var
       count = 0
       pos = ctx.pos
@@ -403,29 +409,30 @@ proc repeat*[R](item: Parser[R], min: int, max = -1): Parser[seq[R]] =
   p.over(item)
   p
 
-proc star*[R](item: Parser[R]): Parser[seq[R]] = item.repeat(0)
-proc plus*[R](item: Parser[R]): Parser[seq[R]] = item.repeat(1)
-proc times*[R](item: Parser[R], n: int): Parser[seq[R]] = item.repeat(n, n)
+proc star*[S, R](item: Parser[S, R]): Parser[S, seq[R]] = item.repeat(0)
+proc plus*[S, R](item: Parser[S, R]): Parser[S, seq[R]] = item.repeat(1)
+proc times*[S, R](item: Parser[S, R], n: int): Parser[S, seq[R]] = item.repeat(n, n)
 
-proc repeatLazy*[R](item: Parser[R], limit: ParserBase, min: int, max = -1): Parser[seq[R]] =
+proc repeatLazy*[S, R](item: Parser[S, R], limit: SourceParser[S], min: int,
+                       max = -1): Parser[S, seq[R]] =
   ## Items until `limit` matches, as few as possible; `limit` is not consumed.
   assert max < 0 or min <= max
   var (item, limit) = (item, limit)
-  let p = Parser[seq[R]](expected: item.expected)
-  p.parseFn = proc (ctx: Context): Result[seq[R]] =
+  let p = Parser[S, seq[R]](expected: item.expected)
+  p.parseFn = proc (ctx: Context[S]): Result[seq[R]] =
     var
       values: seq[R]
       pos = ctx.pos
     while values.len < min or limit.fastParseOn(ctx.at(pos)) < 0:
       if values.len >= min and max >= 0 and values.len >= max:
-        return fail[seq[R]](limit, ctx.at(pos))
+        return fail[S, seq[R]](limit, ctx.at(pos))
       var r = item.parseOn(ctx.at(pos))
       if not r.isSuccess: return failedAs(seq[R], r)
-      if r.pos == pos and values.len >= min: return fail[seq[R]](limit, ctx.at(pos))
+      if r.pos == pos and values.len >= min: return fail[S, seq[R]](limit, ctx.at(pos))
       values.add move(r.val)
       pos = r.pos
     succeed(values, pos)
-  p.fastFn = proc (ctx: Context): int =
+  p.fastFn = proc (ctx: Context[S]): int =
     var
       count = 0
       pos = ctx.pos
@@ -439,15 +446,18 @@ proc repeatLazy*[R](item: Parser[R], limit: ParserBase, min: int, max = -1): Par
   p.overBoth(item, limit)
   p
 
-proc starLazy*[R](item: Parser[R], limit: ParserBase): Parser[seq[R]] = item.repeatLazy(limit, 0)
-proc plusLazy*[R](item: Parser[R], limit: ParserBase): Parser[seq[R]] = item.repeatLazy(limit, 1)
+proc starLazy*[S, R](item: Parser[S, R], limit: SourceParser[S]): Parser[S, seq[R]] =
+  item.repeatLazy(limit, 0)
+proc plusLazy*[S, R](item: Parser[S, R], limit: SourceParser[S]): Parser[S, seq[R]] =
+  item.repeatLazy(limit, 1)
 
-proc repeatGreedy*[R](item: Parser[R], limit: ParserBase, min: int, max = -1): Parser[seq[R]] =
+proc repeatGreedy*[S, R](item: Parser[S, R], limit: SourceParser[S], min: int,
+                         max = -1): Parser[S, seq[R]] =
   ## As many items as match, then back up until `limit` matches after them.
   assert max < 0 or min <= max
   var (item, limit) = (item, limit)
-  let p = Parser[seq[R]](expected: item.expected)
-  p.parseFn = proc (ctx: Context): Result[seq[R]] =
+  let p = Parser[S, seq[R]](expected: item.expected)
+  p.parseFn = proc (ctx: Context[S]): Result[seq[R]] =
     var
       values: seq[R]
       pos = ctx.pos
@@ -464,11 +474,11 @@ proc repeatGreedy*[R](item: Parser[R], limit: ParserBase, min: int, max = -1): P
       pos = r.pos
       stops.add pos
     while limit.fastParseOn(ctx.at(stops[^1])) < 0:
-      if stops.len == 1: return fail[seq[R]](limit, ctx.at(stops[0]))
+      if stops.len == 1: return fail[S, seq[R]](limit, ctx.at(stops[0]))
       discard stops.pop
       discard values.pop
     succeed(values, stops[^1])
-  p.fastFn = proc (ctx: Context): int =
+  p.fastFn = proc (ctx: Context[S]): int =
     var
       count = 0
       pos = ctx.pos
@@ -490,41 +500,41 @@ proc repeatGreedy*[R](item: Parser[R], limit: ParserBase, min: int, max = -1): P
   p.overBoth(item, limit)
   p
 
-proc starGreedy*[R](item: Parser[R], limit: ParserBase): Parser[seq[R]] =
+proc starGreedy*[S, R](item: Parser[S, R], limit: SourceParser[S]): Parser[S, seq[R]] =
   item.repeatGreedy(limit, 0)
-proc plusGreedy*[R](item: Parser[R], limit: ParserBase): Parser[seq[R]] =
+proc plusGreedy*[S, R](item: Parser[S, R], limit: SourceParser[S]): Parser[S, seq[R]] =
   item.repeatGreedy(limit, 1)
 
-proc repeatSeparated*[R, S](item: Parser[R], sep: Parser[S], min: int,
-                            max = -1): Parser[Separated[R, S]] =
+proc repeatSeparated*[S, R, T](item: Parser[S, R], sep: Parser[S, T], min: int,
+                               max = -1): Parser[S, Separated[R, T]] =
   ## Items with `sep` between them; a trailing `sep` is left unconsumed.
   assert max < 0 or min <= max
   var (item, sep) = (item, sep)
-  let p = Parser[Separated[R, S]](expected: item.expected)
-  p.parseFn = proc (ctx: Context): Result[Separated[R, S]] =
+  let p = Parser[S, Separated[R, T]](expected: item.expected)
+  p.parseFn = proc (ctx: Context[S]): Result[Separated[R, T]] =
     var
-      list: Separated[R, S]
+      list: Separated[R, T]
       pos = ctx.pos
     while max < 0 or list.elements.len < max:
       var
         at = pos
-        s: Result[S]
+        s: Result[T]
       if list.elements.len > 0:
         s = sep.parseOn(ctx.at(pos))
         if not s.isSuccess:
-          if list.elements.len < min: return failedAs(Separated[R, S], s)
+          if list.elements.len < min: return failedAs(Separated[R, T], s)
           break
         at = s.pos
       var r = item.parseOn(ctx.at(at))
       if not r.isSuccess:
-        if list.elements.len < min: return failedAs(Separated[R, S], r)
+        if list.elements.len < min: return failedAs(Separated[R, T], r)
         break
       if r.pos == pos and list.elements.len >= min: break
       if list.elements.len > 0: list.separators.add move(s.val)
       list.elements.add move(r.val)
       pos = r.pos
     succeed(list, pos)
-  p.fastFn = proc (ctx: Context): int =
+  p.fastFn = proc (ctx: Context[S]): int =
     var
       count = 0
       pos = ctx.pos
@@ -546,19 +556,20 @@ proc repeatSeparated*[R, S](item: Parser[R], sep: Parser[S], min: int,
   p.overBoth(item, sep)
   p
 
-proc starSeparated*[R, S](item: Parser[R], sep: Parser[S]): Parser[Separated[R, S]] =
+proc starSeparated*[S, R, T](item: Parser[S, R], sep: Parser[S, T]): Parser[S, Separated[R, T]] =
   item.repeatSeparated(sep, 0)
-proc plusSeparated*[R, S](item: Parser[R], sep: Parser[S]): Parser[Separated[R, S]] =
+proc plusSeparated*[S, R, T](item: Parser[S, R], sep: Parser[S, T]): Parser[S, Separated[R, T]] =
   item.repeatSeparated(sep, 1)
-proc timesSeparated*[R, S](item: Parser[R], sep: Parser[S], n: int): Parser[Separated[R, S]] =
+proc timesSeparated*[S, R, T](item: Parser[S, R], sep: Parser[S, T],
+                              n: int): Parser[S, Separated[R, T]] =
   item.repeatSeparated(sep, n, n)
 
-proc foldLeft*[R, S](list: Separated[R, S], fn: (R, S, R) -> R): R =
+proc foldLeft*[R, T](list: Separated[R, T], fn: (R, T, R) -> R): R =
   ## `((e0 sep0 e1) sep1 e2) …`; needs an element.
   result = list.elements[0]
   for i, sep in list.separators: result = fn(result, sep, list.elements[i + 1])
 
-proc foldRight*[R, S](list: Separated[R, S], fn: (R, S, R) -> R): R =
+proc foldRight*[R, T](list: Separated[R, T], fn: (R, T, R) -> R): R =
   ## `e0 sep0 (e1 sep1 (e2 …))`; needs an element.
   result = list.elements[^1]
   for i in countdown(list.separators.high, 0):
@@ -571,144 +582,146 @@ proc keepStop(stop, start: int): int = stop
   ## The default fast path of `through`: a named proc, since the JS
   ## backend emits a lambda default of a generic inside its first caller.
 
-proc through[D, R](p: Parser[D], read: (var Result[D], Context) -> Result[R],
-                   fast: (int, int) -> int = keepStop): Parser[R] =
+proc through[S, D, R](p: Parser[S, D], read: (var Result[D], Context[S]) -> Result[R],
+                      fast: (int, int) -> int = keepStop): Parser[S, R] =
   ## Callers instantiate it explicitly: Nim 2.2.12 does not infer `D`
   ## through the `var` parameter.
   var p = p
-  let t = Parser[R](expected: p.expected)
-  t.parseFn = proc (ctx: Context): Result[R] =
+  let t = Parser[S, R](expected: p.expected)
+  t.parseFn = proc (ctx: Context[S]): Result[R] =
     var r = p.parseOn(ctx)
     read(r, ctx)
-  t.fastFn = (ctx: Context) => fast(p.fastParseOn(ctx), ctx.pos)
+  t.fastFn = (ctx: Context[S]) => fast(p.fastParseOn(ctx), ctx.pos)
   t.over(p)
   t
 
-proc optional*[R](p: Parser[R]): Parser[Option[R]] =
-  through[R, Option[R]](p, (r: var Result[R], ctx: Context) -> Result[Option[R]] =>
+proc optional*[S, R](p: Parser[S, R]): Parser[S, Option[R]] =
+  through[S, R, Option[R]](p, (r: var Result[R], ctx: Context[S]) -> Result[Option[R]] =>
     (if r.isSuccess: succeed(some(move(r.val)), r.pos) else: succeed(none(R), ctx.pos)),
     (stop, start: int) => max(stop, start))
 
-proc optional*[R](p: Parser[R], value: R): Parser[R] =
+proc optional*[S, R](p: Parser[S, R], value: R): Parser[S, R] =
   ## `p`, or `value` where `p` does not match.
-  through[R, R](p, (r: var Result[R], ctx: Context) -> Result[R] =>
+  through[S, R, R](p, (r: var Result[R], ctx: Context[S]) -> Result[R] =>
     (if r.isSuccess: move(r) else: succeed(value, ctx.pos)),
     (stop, start: int) => max(stop, start))
 
-proc map*[A, B](p: Parser[A], fn: (A) -> B): Parser[B] =
+proc map*[S, A, B](p: Parser[S, A], fn: (A) -> B): Parser[S, B] =
   ## `fn` is taken as pure: the fast path skips it. It is handed a copy of
   ## the value; a lambda with a `sink` parameter is handed the value itself.
-  through[A, B](p, (r: var Result[A], ctx: Context) -> Result[B] =>
+  through[S, A, B](p, (r: var Result[A], ctx: Context[S]) -> Result[B] =>
     (if r.isSuccess: succeed(fn(r.val), r.pos) else: failedAs(B, r)))
 
-proc map*[A, B](p: Parser[A], fn: (sink A) -> B): Parser[B] =
-  through[A, B](p, (r: var Result[A], ctx: Context) -> Result[B] =>
+proc map*[S, A, B](p: Parser[S, A], fn: (sink A) -> B): Parser[S, B] =
+  through[S, A, B](p, (r: var Result[A], ctx: Context[S]) -> Result[B] =>
     (if r.isSuccess: succeed(fn(move(r.val)), r.pos) else: failedAs(B, r)))
 
-proc pick*[T: tuple](p: Parser[T], i: static int): Parser[typeof(default(T)[i])] =
+proc pick*[S, T](p: Parser[S, T], i: static int): Parser[S, typeof(default(T)[i])] =
   ## One value of a tuple, moved out. `map(t => t[i])` copies it.
-  through[T, typeof(default(T)[i])](p, (r: var Result[T], ctx: Context) -> Result[typeof(default(T)[i])] =>
-    (if r.isSuccess: succeed(move(r.val[i]), r.pos)
-     else: failedAs(typeof(default(T)[i]), r)))
+  through[S, T, typeof(default(T)[i])](p,
+    (r: var Result[T], ctx: Context[S]) -> Result[typeof(default(T)[i])] =>
+      (if r.isSuccess: succeed(move(r.val[i]), r.pos)
+       else: failedAs(typeof(default(T)[i]), r)))
 
-proc elements*[R, S](p: Parser[Separated[R, S]]): Parser[seq[R]] =
+proc elements*[S, R, T](p: Parser[S, Separated[R, T]]): Parser[S, seq[R]] =
   ## The elements of a separated list, moved out.
-  through[Separated[R, S], seq[R]](p, (r: var Result[Separated[R, S]], ctx: Context) -> Result[seq[R]] =>
-    (if r.isSuccess: succeed(move(r.val.elements), r.pos) else: failedAs(seq[R], r)))
+  through[S, Separated[R, T], seq[R]](p,
+    (r: var Result[Separated[R, T]], ctx: Context[S]) -> Result[seq[R]] =>
+      (if r.isSuccess: succeed(move(r.val.elements), r.pos) else: failedAs(seq[R], r)))
 
-proc delimited*[A, B, C](open: Parser[A], close: Parser[C], inside: Parser[B]): Parser[B] =
+proc delimited*[S, A, B, C](open: Parser[S, A], close: Parser[S, C],
+                            inside: Parser[S, B]): Parser[S, B] =
   ## `inside` between `open` and `close`, keeping only its value.
   sequence((open, inside, close)).pick(1)
 
-proc `==>`*[A, B](p: Parser[A], fn: (A) -> B): Parser[B] = p.map(fn)
+proc `==>`*[S, A, B](p: Parser[S, A], fn: (A) -> B): Parser[S, B] = p.map(fn)
 
-proc token*[R](p: Parser[R]): Parser[Token[R]] =
-  through[R, Token[R]](p, proc (r: var Result[R], ctx: Context): Result[Token[R]] =
+proc token*[S, R](p: Parser[S, R]): Parser[S, Token[R]] =
+  through[S, R, Token[R]](p, proc (r: var Result[R], ctx: Context[S]): Result[Token[R]] =
     if r.isSuccess:
       succeed(Token[R](value: move(r.val), input: ctx.input, start: ctx.pos, stop: r.pos), r.pos)
     else: failedAs(Token[R], r))
 
-proc text*[R](t: Token[R]): string = t.input.text[t.start ..< t.stop]
-
-proc ahead*[R](p: Parser[R]): Parser[R] =
+proc ahead*[S, R](p: Parser[S, R]): Parser[S, R] =
   ## Positive lookahead: `p`'s value, no input consumed.
-  through[R, R](p, (r: var Result[R], ctx: Context) -> Result[R] =>
+  through[S, R, R](p, (r: var Result[R], ctx: Context[S]) -> Result[R] =>
     (if r.isSuccess: succeed(move(r.val), ctx.pos) else: move(r)),
     (stop, start: int) => (if stop < 0: -1 else: start))
 
-proc where*[R](p: Parser[R], pred: (R) -> bool, expected: string): Parser[R] =
+proc where*[S, R](p: Parser[S, R], pred: (R) -> bool, expected: string): Parser[S, R] =
   ## `p`'s value where `pred` holds; otherwise a failure where `p` ended,
   ## the furthest point the judged span reached.
   var p = p
-  let w = Parser[R](expected: expected)
-  w.parseFn = proc (ctx: Context): Result[R] =
+  let w = Parser[S, R](expected: expected)
+  w.parseFn = proc (ctx: Context[S]): Result[R] =
     let r = p.parseOn(ctx)
-    if r.isSuccess and not pred(r.val): fail[R](w, ctx.at(r.pos)) else: r
+    if r.isSuccess and not pred(r.val): fail[S, R](w, ctx.at(r.pos)) else: r
   w.fastFn = w.recognising
   w.over(p)
   w
 
-proc callCC*[D, R](p: Parser[D], handler: (Parser[D], Context) -> Result[R]): Parser[R] =
+proc callCC*[S, D, R](p: Parser[S, D],
+                      handler: (Parser[S, D], Context[S]) -> Result[R]): Parser[S, R] =
   ## `handler` is handed `p` and decides whether, how often and with what
   ## to run it: tracing, profiling, memoisation.
   var p = p
-  let c = Parser[R](expected: p.expected)
-  c.parseFn = (ctx: Context) => handler(p, ctx)
+  let c = Parser[S, R](expected: p.expected)
+  c.parseFn = (ctx: Context[S]) => handler(p, ctx)
   c.fastFn = c.recognising
   c.over(p)
   c
 
 # flatten, skip and negative lookahead only recognise their delegate
 
-proc flatten*(p: ParserBase, expected = ""): Parser[string] =
-  ## The input `p` consumed, as text; `p` builds nothing and its failures
-  ## are reported as this node's.
+proc flatten*[S](p: SourceParser[S], expected = ""): Parser[S, S] =
+  ## The stretch of source `p` consumed; `p` builds nothing and its
+  ## failures are reported as this node's.
   var p = p
-  result = leaf[string](if expected.len > 0: expected else: p.expected,
-                        (ctx: Context) => p.fastParseOn(ctx),
-                        (ctx: Context, stop: int) => ctx.input.text[ctx.pos ..< stop])
+  result = leaf[S, S](if expected.len > 0: expected else: p.expected,
+                      (ctx: Context[S]) => p.fastParseOn(ctx),
+                      (ctx: Context[S], stop: int) => ctx.input.source[ctx.pos ..< stop])
   result.over(p)
 
-proc skip*(p: ParserBase, expected = ""): Parser[Nothing] =
+proc skip*[S](p: SourceParser[S], expected = ""): Parser[S, Nothing] =
   var p = p
-  result = leaf[Nothing](if expected.len > 0: expected else: p.expected,
-                         (ctx: Context) => p.fastParseOn(ctx),
-                         (ctx: Context, stop: int) => Nothing())
+  result = leaf[S, Nothing](if expected.len > 0: expected else: p.expected,
+                            (ctx: Context[S]) => p.fastParseOn(ctx),
+                            (ctx: Context[S], stop: int) => Nothing())
   result.over(p)
 
-proc notAhead*(p: ParserBase, expected = ""): Parser[Nothing] =
+proc notAhead*[S](p: SourceParser[S], expected = ""): Parser[S, Nothing] =
   var p = p
-  result = leaf[Nothing](if expected.len > 0: expected else: "not " & p.expected,
-                         (ctx: Context) => (if p.fastParseOn(ctx) < 0: ctx.pos else: -1),
-                         (ctx: Context, stop: int) => Nothing())
+  result = leaf[S, Nothing](if expected.len > 0: expected else: "not " & p.expected,
+                            (ctx: Context[S]) => (if p.fastParseOn(ctx) < 0: ctx.pos else: -1),
+                            (ctx: Context[S], stop: int) => Nothing())
   result.over(p)
 
-proc neg*(p: ParserBase, E: typedesc[char | byte] = char): Parser[E] =
-  ## Anything but `p`: one `E` where `p` does not match.
+proc neg*[S](p: SourceParser[S]): Parser[S, typeof(default(S)[0])] =
+  ## Anything but `p`: one element where `p` does not match.
   var p = p
-  result = leaf[E]("not " & p.expected,
-    (ctx: Context) => (if ctx.pos < ctx.input.stop and p.fastParseOn(ctx) < 0: ctx.pos + 1
-                       else: -1),
-    (ctx: Context, stop: int) => E(ctx.input.text[ctx.pos]))
+  result = leaf[S, typeof(default(S)[0])]("not " & p.expected,
+    (ctx: Context[S]) => (if ctx.pos < ctx.input.stop and p.fastParseOn(ctx) < 0: ctx.pos + 1
+                          else: -1),
+    (ctx: Context[S], stop: int) => ctx.input.source[ctx.pos])
   result.over(p)
 
 # ---------------------------------------------------------------------------
 # Trimming: `left` and `right` are skipped as often as they match
 
-proc skipAll(trimmer: ParserBase, ctx: Context): int =
+proc skipAll[S](trimmer: SourceParser[S], ctx: Context[S]): int =
   result = ctx.pos
   while true:
     let next = trimmer.fastParseOn(ctx.at(result))
     if next < 0 or next == result: return
     result = next
 
-proc trim*[R](p: Parser[R], left, right: ParserBase): Parser[R] =
+proc trim*[S, R](p: Parser[S, R], left, right: SourceParser[S]): Parser[S, R] =
   var (p, left, right) = (p, left, right)
-  let t = Parser[R](expected: p.expected)
-  t.parseFn = proc (ctx: Context): Result[R] =
+  let t = Parser[S, R](expected: p.expected)
+  t.parseFn = proc (ctx: Context[S]): Result[R] =
     var r = p.parseOn(ctx.at(left.skipAll(ctx)))
     if r.isSuccess: succeed(move(r.val), right.skipAll(ctx.at(r.pos))) else: move(r)
-  t.fastFn = proc (ctx: Context): int =
+  t.fastFn = proc (ctx: Context[S]): int =
     let pos = p.fastParseOn(ctx.at(left.skipAll(ctx)))
     if pos < 0: -1 else: right.skipAll(ctx.at(pos))
   t.childrenFn = () => kids(p, left, right)
@@ -718,47 +731,47 @@ proc trim*[R](p: Parser[R], left, right: ParserBase): Parser[R] =
     swapIn(right, source, target)
   t
 
-proc trim*[R](p: Parser[R], ws: ParserBase = whitespace()): Parser[R] = p.trim(ws, ws)
+proc trim*[S, R](p: Parser[S, R], ws: SourceParser[S]): Parser[S, R] = p.trim(ws, ws)
 
 # ---------------------------------------------------------------------------
 # Forward references: `undefined` then `define`; `resolve` removes them
 
-type SettableParser*[R] = ref object of Parser[R]
-  target: Parser[R]
+type SettableParser*[S, R] = ref object of Parser[S, R]
+  target: Parser[S, R]
 
-proc nesting[R](p: Parser[R]): Parser[R] =
+proc nesting[S, R](p: Parser[S, R]): Parser[S, R] =
   ## `p` as one level of nesting, failing past `MaxDepth`.
   var p = p
   let
-    n = Parser[R](expected: p.expected)
+    n = Parser[S, R](expected: p.expected)
     deep = ParserBase(expected: "shallower nesting")
-  n.parseFn = proc (ctx: Context): Result[R] =
-    if ctx.input.depth >= MaxDepth: return fail[R](deep, ctx)
-    inc ctx.input.depth
+  n.parseFn = proc (ctx: Context[S]): Result[R] =
+    if ctx.input.run.depth >= MaxDepth: return fail[S, R](deep, ctx)
+    inc ctx.input.run.depth
     result = p.parseOn(ctx)
-    dec ctx.input.depth
-  n.fastFn = proc (ctx: Context): int =
-    if ctx.input.depth >= MaxDepth: return -1
-    inc ctx.input.depth
+    dec ctx.input.run.depth
+  n.fastFn = proc (ctx: Context[S]): int =
+    if ctx.input.run.depth >= MaxDepth: return -1
+    inc ctx.input.run.depth
     result = p.fastParseOn(ctx)
-    dec ctx.input.depth
+    dec ctx.input.run.depth
   n.over(p)
   n
 
-proc undefined*[R](name = ""): SettableParser[R] =
+proc undefined*[S, R](name = ""): SettableParser[S, R] =
   ## A placeholder that fails until it is `define`d.
-  let s = SettableParser[R](name: name, expected: name, isRef: true)
-  var standIn: Parser[R]
-  s.target = failure[R](if name.len > 0: name else: "undefined parser")
-  s.parseFn = (ctx: Context) => s.target.parseOn(ctx)
-  s.fastFn = (ctx: Context) => s.target.fastParseOn(ctx)
+  let s = SettableParser[S, R](name: name, expected: name, isRef: true)
+  var standIn: Parser[S, R]
+  s.target = failure[S, R](if name.len > 0: name else: "undefined parser")
+  s.parseFn = (ctx: Context[S]) => s.target.parseOn(ctx)
+  s.fastFn = (ctx: Context[S]) => s.target.fastParseOn(ctx)
   s.over(s.target)
   s.nestFn = proc (target: ParserBase): ParserBase =
-    if standIn.isNil: standIn = nesting(Parser[R](target))
+    if standIn.isNil: standIn = nesting(Parser[S, R](target))
     standIn
   s
 
-proc define*[R](p: SettableParser[R], target: Parser[R]) = p.target = target
+proc define*[S, R](p: SettableParser[S, R], target: Parser[S, R]) = p.target = target
 
 proc containsOrIncl(seen: var seq[ParserBase], p: ParserBase): bool =
   result = p in seen
@@ -798,33 +811,32 @@ proc resolved(p: ParserBase): ParserBase =
   let t = p.deref
   if t == p: p else: p.nestFn(t)
 
-proc resolve*[R](root: Parser[R]): Parser[R] =
+proc resolve*[S, R](root: Parser[S, R]): Parser[S, R] =
   ## Rewire every parent past its forward references, leaving a node that
   ## counts the nesting where each placeholder was. Cycles stay.
   for p in root.allParsers:
     for c in p.children:
       let r = c.resolved
       if r != c: p.replace(c, r)
-  Parser[R](root.resolved)
+  Parser[S, R](root.resolved)
 
 # ---------------------------------------------------------------------------
 # Entry points
 
-proc parse*[R](p: Parser[R], text: sink string): Result[R] =
-  ## A failure reports the furthest position any node reached.
-  let input = newInput(text)
-  result = p.parseOn(Context(input: input))
+proc parse*[S, R](p: Parser[S, R], source: sink S): Result[R] =
+  ## A failure reports the furthest position any node reached. A source
+  ## module may give `newInput` for its source, to say how positions print.
+  mixin newInput
+  let input = newInput(source)
+  result = p.parseOn(Context[S](input: input))
   if not result.isSuccess:
-    if input.furthestNodes.len > 0:
-      result.failed = input.furthestNodes[^1]
-      result.pos = input.furthestPos
+    if input.run.nodes.len > 0:
+      result.failed = input.run.nodes[^1]
+      result.pos = input.run.pos
     result.input = input
 
-proc parse*[R](p: Parser[R], data: openArray[byte]): Result[R] = p.parse(data.toText)
+proc accepts*[S](p: SourceParser[S], source: sink S): bool =
+  mixin newInput
+  p.fastParseOn(Context[S](input: newInput(source))) >= 0
 
-proc accepts*(p: ParserBase, text: string): bool =
-  p.fastParseOn(Context(input: newInput(text))) >= 0
-
-proc accepts*(p: ParserBase, data: openArray[byte]): bool = p.accepts(data.toText)
-
-proc complete*[R](p: Parser[R]): Parser[R] = (p & endOfInput()).pick(0)
+proc complete*[S, R](p: Parser[S, R]): Parser[S, R] = (p & endOfInput[S]()).pick(0)

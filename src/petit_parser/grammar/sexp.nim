@@ -3,7 +3,7 @@
 ## integer is a number, any other is a symbol.
 
 import std/[parseutils, sugar, strutils]
-import ../parser
+import ../../petit_parser
 
 type
   SexpKind* = enum
@@ -33,11 +33,11 @@ proc escaped(c: char): string =
   of 't': "\t"
   else: $c
 
-proc sexpParser*(): Parser[Sexp] =
+proc sexpParser*(): TextParser[Sexp] =
   let
     comment = (ch(';') & neg(newline()).star).skip
     ws = chars(" \t\r\n", "whitespace").skip / comment
-    sexp = undefined[Sexp]("sexp")
+    sexp = undefined[string, Sexp]("sexp")
     form = sexp.trim(ws)
 
     quote = (ch('\'') & form).pick(1).map(quoting)
