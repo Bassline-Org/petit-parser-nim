@@ -7,7 +7,7 @@
 
 import std/[algorithm, sequtils, strutils, sugar, tables]
 import ../parser
-import ./[bassline_text, sexp, json]
+import ./[bassline_text, sexp, json, uri]
 export bassline_text
 
 type Dialects* = Table[string, Parser[BlNode]]
@@ -100,4 +100,5 @@ proc jsonDialect*(): Parser[BlNode] =
   ## an integer is refused.
   jsonParser().where(integral, "integers only").map(jsonNode)
 
-proc standardDialects*(): Dialects = {"sexp": sexpDialect(), "json": jsonDialect()}.toTable
+proc standardDialects*(): Dialects =
+  {"sexp": sexpDialect(), "json": jsonDialect(), "uri": uriParser()}.toTable
