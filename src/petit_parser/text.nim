@@ -10,12 +10,13 @@ proc lineCol*(text: string, pos: int): (int, int) =
   let before = text[0 ..< min(pos, text.len)]
   (before.count('\n') + 1, pos - before.rfind('\n'))
 
+proc locateLineCol(input: InputBase, pos: int): string =
+  let (line, col) = lineCol(Input[string](input).source, pos)
+  $line & ":" & $col
+
 proc newInput*(text: sink string): Input[string] =
   result = parser.newInput[string](text)
-  let input = result
-  result.locateFn = proc (pos: int): string =
-    let (line, col) = lineCol(input.source, pos)
-    $line & ":" & $col
+  result.locateFn = locateLineCol
 
 proc chars*(cs: set[char], expected: string): TextParser[char] = oneOf[string, char](cs, expected)
 proc chars*(cs, expected: string): TextParser[char] = oneOf[string, char](cs.toSet, expected)

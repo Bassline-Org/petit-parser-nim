@@ -1,6 +1,3 @@
-## Leaves over bytes: a `seq[byte]` source, with positions that print as
-## byte offsets.
-
 import std/[strutils, setutils, sugar]
 import ./parser
 
@@ -25,7 +22,7 @@ proc str*(lit: openArray[byte]): ByteParser[seq[byte]] =
 proc parse*[R](p: ByteParser[R], data: openArray[byte]): Result[R] = parser.parse(p, @data)
 proc accepts*(p: SourceParser[seq[byte]], data: openArray[byte]): bool = parser.accepts(p, @data)
 
-proc toBytes*(s: string): seq[byte] = @(s.toOpenArrayByte(0, s.high))
+proc toByteSeq*(s: string): seq[byte] = @(s.toOpenArrayByte(0, s.high))
 
 func toText*(data: openArray[byte]): string =
   result = newString(data.len)

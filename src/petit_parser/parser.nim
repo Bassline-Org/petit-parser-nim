@@ -31,8 +31,11 @@ type
     stop*: int                   ## where reading ends: the length, or a block's end
     parent*: InputBase           ## the input this one was entered from, if any
     at*: int                     ## and where
+    depth*: int                  ## how many inputs this one is entered through
     run*: Run
-    locateFn*: (int) -> string   ## how a position prints; nil for the default
+    locateFn*: Locate            ## how a position prints in a message; nil for the default
+
+  Locate* = proc (input: InputBase, pos: int): string {.nimcall.}
 
   Input*[S] = ref object of InputBase
     source*: S
@@ -98,20 +101,24 @@ proc newInput*[S](source: sink S): Input[S] =
 proc child*[S](parent: InputBase, at: int, source: sink S): Input[S] =
   ## A source entered from `parent` at `at`: a frame's body, a block. It
   ## shares the parent's run, so failures inside it count toward the
-  ## furthest.
-  result = Input[S](source: source, run: parent.run, parent: parent, at: at)
+  ## furthest, and prints positions as its parent does when it reads the
+  ## same kind of source.
+  result = Input[S](source: source, run: parent.run, parent: parent, at: at,
+                    depth: parent.depth + 1)
   result.stop = result.source.len
+  if parent of Input[S]: result.locateFn = parent.locateFn
 
-proc place(input: InputBase, pos: int): seq[int] =
+proc place*(input: InputBase, pos: int): seq[int] =
   ## The path to `pos` from the root input, outermost first.
-  result = @[pos]
+  result = newSeq[int](input.depth + 1)
+  result[^1] = pos
   var i = input
   while not i.parent.isNil:
-    result.insert(i.at, 0)
+    result[i.depth - 1] = i.at
     i = i.parent
 
 proc locate*(input: InputBase, pos: int): string =
-  if not input.locateFn.isNil: input.locateFn(pos)
+  if not input.locateFn.isNil: input.locateFn(input, pos)
   elif input.parent.isNil: $pos
   else: input.place(pos).join(".")
 
@@ -137,19 +144,26 @@ template at*(ctx: Context, newPos: int): untyped =
 proc succeed*[R](value: sink R, pos: int): Result[R] {.inline.} =
   Result[R](isSuccess: true, val: value, pos: pos)
 
-proc afterwards(a, b: seq[int]): bool =
-  ## Is path `a` later than `b` in document order? A longer path with an
-  ## equal prefix is later: inside a frame comes after the frame.
-  for i in 0 ..< min(a.len, b.len):
-    if a[i] != b[i]: return a[i] > b[i]
-  a.len > b.len
+proc cmpPlace(a: InputBase, apos: int, b: InputBase, bpos: int): int =
+  ## Document order of two places, each a position in an input, by their
+  ## paths from the root without spelling them out. Inside a frame comes
+  ## after the frame.
+  if a == b or a.parent.isNil or b.parent.isNil: return cmp(apos, bpos)
+  if a.depth > b.depth:
+    let c = cmpPlace(a.parent, a.at, b, bpos)
+    return if c != 0: c else: 1
+  if b.depth > a.depth:
+    let c = cmpPlace(a, apos, b.parent, b.at)
+    return if c != 0: c else: -1
+  let c = cmpPlace(a.parent, a.at, b.parent, b.at)
+  if c != 0: c else: cmp(apos, bpos)
 
 proc later(input: InputBase, pos: int, run: Run): bool {.inline.} =
   ## Is (`input`, `pos`) further on in document order than the run's
   ## furthest failure?
   if run.input.isNil: return true
   if input == run.input: return pos > run.pos
-  input.place(pos).afterwards(run.input.place(run.pos))
+  cmpPlace(input, pos, run.input, run.pos) > 0
 
 proc record(input: InputBase, node: ParserBase, pos: int) {.inline.} =
   let run = input.run
@@ -163,6 +177,20 @@ proc record(input: InputBase, node: ParserBase, pos: int) {.inline.} =
 proc fail*[S, R](node: ParserBase, ctx: Context[S]): Result[R] =
   ## A failure of `node` where `ctx` stands, remembered for the message.
   ctx.input.record(node, ctx.pos)
+  Result[R](isSuccess: false, failed: node, pos: ctx.pos)
+
+proc judged*[S, R](node: ParserBase, ctx: Context[S]): Result[R] =
+  ## A failure of `node` about the whole span that ended where `ctx`
+  ## stands. It outranks the guesses made inside the span, so the message
+  ## names it alone when nothing failed further on.
+  let
+    input = InputBase(ctx.input)
+    run = input.run
+  if not input.later(ctx.pos, run) and (input != run.input or ctx.pos != run.pos):
+    return Result[R](isSuccess: false, failed: node, pos: ctx.pos)
+  run.input = input
+  run.pos = ctx.pos
+  run.nodes = @[node]
   Result[R](isSuccess: false, failed: node, pos: ctx.pos)
 
 template failedAs*(T: typedesc, r: untyped): untyped =
@@ -655,7 +683,7 @@ proc where*[S, R](p: Parser[S, R], pred: (R) -> bool, expected: string): Parser[
   let w = Parser[S, R](expected: expected)
   w.parseFn = proc (ctx: Context[S]): Result[R] =
     let r = p.parseOn(ctx)
-    if r.isSuccess and not pred(r.val): fail[S, R](w, ctx.at(r.pos)) else: r
+    if r.isSuccess and not pred(r.val): judged[S, R](w, ctx.at(r.pos)) else: r
   w.fastFn = w.recognising
   w.over(p)
   w
