@@ -10,8 +10,8 @@ type
   Group*[S, R] = ref object
     loopback: Parser[S, R]
     wrappers: seq[Parser[S, R]]
-    prefixes, postfixes: seq[Parser[S, (R) -> R]]
-    lefts, rights: seq[Parser[S, (R, R) -> R]]
+    prefixes, postfixes: seq[Parser[S, (sink R) -> R]]
+    lefts, rights: seq[Parser[S, (sink R, sink R) -> R]]
 
   ExpressionBuilder*[S, R] = ref object
     loopback: SettableParser[S, R]
@@ -27,39 +27,57 @@ proc group*[S, R](b: ExpressionBuilder[S, R]): Group[S, R] =
   result = Group[S, R](loopback: b.loopback)
   b.groups.add result
 
+# Each action has a sink param version & a normal proc version
+
+proc wrapper*[S, R, L, T](g: Group[S, R], left: Parser[S, L], right: Parser[S, T],
+                          action: (L, sink R, T) -> R): Group[S, R] {.discardable.} =
+  ## `left`, the whole expression, `right`.
+  g.wrappers.add sequence((left, g.loopback, right)).map((t: sink (L, R, T)) => action(t[0], t[1], t[2]))
+  g
+
 proc wrapper*[S, R, L, T](g: Group[S, R], left: Parser[S, L], right: Parser[S, T],
                           action: (L, R, T) -> R): Group[S, R] {.discardable.} =
-  ## `left`, the whole expression, `right`.
-  g.wrappers.add sequence((left, g.loopback, right)).map((t: (L, R, T)) => action(t[0], t[1], t[2]))
+  g.wrapper(left, right, (l: L, a: sink R, r: T) => action(l, a, r))
+
+proc prefix*[S, R, O](g: Group[S, R], op: Parser[S, O], action: (O, sink R) -> R): Group[S, R] {.discardable.} =
+  g.prefixes.add op.map((o: O) => ((a: sink R) => action(o, a)))
   g
 
 proc prefix*[S, R, O](g: Group[S, R], op: Parser[S, O], action: (O, R) -> R): Group[S, R] {.discardable.} =
-  g.prefixes.add op.map((o: O) => ((a: R) => action(o, a)))
+  g.prefix(op, (o: O, a: sink R) => action(o, a))
+
+proc postfix*[S, R, O](g: Group[S, R], op: Parser[S, O], action: (sink R, O) -> R): Group[S, R] {.discardable.} =
+  g.postfixes.add op.map((o: O) => ((a: sink R) => action(a, o)))
   g
 
 proc postfix*[S, R, O](g: Group[S, R], op: Parser[S, O], action: (R, O) -> R): Group[S, R] {.discardable.} =
-  g.postfixes.add op.map((o: O) => ((a: R) => action(a, o)))
+  g.postfix(op, (a: sink R, o: O) => action(a, o))
+
+proc left*[S, R, O](g: Group[S, R], op: Parser[S, O], action: (sink R, O, sink R) -> R): Group[S, R] {.discardable.} =
+  ## Left-associative: `a op b op c` is `(a op b) op c`.
+  g.lefts.add op.map((o: O) => ((a, b: sink R) => action(a, o, b)))
   g
 
 proc left*[S, R, O](g: Group[S, R], op: Parser[S, O], action: (R, O, R) -> R): Group[S, R] {.discardable.} =
-  ## Left-associative: `a op b op c` is `(a op b) op c`.
-  g.lefts.add op.map((o: O) => ((a, b: R) => action(a, o, b)))
+  g.left(op, (a: sink R, o: O, b: sink R) => action(a, o, b))
+
+proc right*[S, R, O](g: Group[S, R], op: Parser[S, O], action: (sink R, O, sink R) -> R): Group[S, R] {.discardable.} =
+  ## Right-associative: `a op b op c` is `a op (b op c)`.
+  g.rights.add op.map((o: O) => ((a, b: sink R) => action(a, o, b)))
   g
 
 proc right*[S, R, O](g: Group[S, R], op: Parser[S, O], action: (R, O, R) -> R): Group[S, R] {.discardable.} =
-  ## Right-associative: `a op b op c` is `a op (b op c)`.
-  g.rights.add op.map((o: O) => ((a, b: R) => action(a, o, b)))
-  g
+  g.right(op, (a: sink R, o: O, b: sink R) => action(a, o, b))
 
-proc applyPrefixes[R](t: (seq[(R) -> R], R)): R =
-  result = t[1]
+proc applyPrefixes[R](t: sink (seq[(sink R) -> R], R)): R =
+  result = move t[1]
   for i in countdown(t[0].high, 0): result = t[0][i](result)
 
-proc applyPostfixes[R](t: (R, seq[(R) -> R])): R =
-  result = t[0]
+proc applyPostfixes[R](t: sink (R, seq[(sink R) -> R])): R =
+  result = move t[0]
   for f in t[1]: result = f(result)
 
-proc applyBinary[R](a: R, f: (R, R) -> R, b: R): R = f(a, b)
+proc applyBinary[R](a: sink R, f: (sink R, sink R) -> R, b: sink R): R = f(a, b)
 
 proc build[S, R](g: Group[S, R], inner: Parser[S, R]): Parser[S, R] =
   result = inner
@@ -70,10 +88,10 @@ proc build[S, R](g: Group[S, R], inner: Parser[S, R]): Parser[S, R] =
     result = sequence((result, choice(g.postfixes).star)).map(applyPostfixes[R])
   if g.rights.len > 0:
     let terms = result.plusSeparated(choice(g.rights))
-    result = terms.map((l: Separated[R, (R, R) -> R]) => l.foldRight(applyBinary[R]))
+    result = terms.map((l: sink Separated[R, (sink R, sink R) -> R]) => l.foldRight(applyBinary[R]))
   if g.lefts.len > 0:
     let terms = result.plusSeparated(choice(g.lefts))
-    result = terms.map((l: Separated[R, (R, R) -> R]) => l.foldLeft(applyBinary[R]))
+    result = terms.map((l: sink Separated[R, (sink R, sink R) -> R]) => l.foldLeft(applyBinary[R]))
 
 proc build*[S, R](b: ExpressionBuilder[S, R]): Parser[S, R] =
   ## The expression parser, its forward references resolved.

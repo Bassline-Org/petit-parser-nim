@@ -137,7 +137,9 @@ items. They return a `Separated` with `elements` and `separators`. A
 trailing separator is left unconsumed. `foldLeft` and `foldRight` reduce
 one with a `(a, sep, b) -> a` function, so
 `term.plusSeparated(op).map(l => l.foldLeft(apply))` is a left
-associative operator level.
+associative operator level. As with `map`, a function with `sink`
+parameters is handed the elements themselves and one with plain
+parameters copies of them.
 
 ### Reading values
 
@@ -230,12 +232,84 @@ b.group.left(ch('+').trim, (a: int, op: char, b: int) => a + b)
 let calc = b.build.complete
 ```
 
+An action with `sink` operands, `(a: sink Node, op: char, b: sink Node)`,
+is handed the operands themselves, so a tree is built without copying
+its branches.
+
+### Shapes and analysis
+
+A node is a shape and a behaviour. The shape is its `kind` (`nkSet`,
+`nkLiteral`, `nkSequence`, `nkChoice`, `nkRepeat`, `nkTrim`, …), its
+`children`, and a few payload fields: `min` and `max` for a repetition,
+`elementSet` for a set node, as bytes. A leaf written with `leaf` or
+`item`, and a `callCC`, are `nkLeaf` and `nkCallCC`: nothing is known of
+what they read. `allParsers` lists every node reachable from a root.
+
+`analyse(root)` reads three things off the shapes, as fixpoints over the
+graph, cycles included: `first(p)`, the elements that may begin a match
+of `p`, with `known` false where a hand-written leaf makes it anything;
+`nullable(p)`, whether `p` may succeed consuming nothing; and `next(p)`,
+what may follow `p` in a parse from the root. The analyses are in byte
+space and mean something for `string` and `seq[byte]` sources.
+
+```nim
+let a = analyse(calc)
+echo a.first(primary)      # {40, 48..57, 9..13, 32}: '(', digits and whitespace
+echo a.nullable(digit().star)   # true
+```
+
+### Optimising
+
+`optimize` is a rewrite like `resolve`, run after it, that keeps what a
+grammar reads and answers and changes how. Write the grammar the plain
+way and call `optimize` once, where you would call `resolve`:
+
+```nim
+let grammar = value.complete.optimize
+```
+
+It does four things, each a shape found in the graph and a node that
+does the same work in fewer steps:
+
+- A choice of sets is one set; `neg` of a set is its complement;
+  `notAhead` of a set is a `test`, one look at the next element.
+- A repetition of a set, `digit().plus`, is a `span`, one loop over the
+  elements. So is a repetition of a choice that begins with sets, such as
+  `(whitespace().skip / comment).star`: the loop takes the whitespace and
+  reads a comment as before. A trimmer is the span of itself, so `trim`
+  skips a run of whitespace in one call.
+- A choice is dispatched: told, from its alternatives' first sets, which
+  of them can begin with each next element, and it tries only those. An
+  alternative whose first set is unknown or nullable is tried everywhere.
+  The alternatives it skips are recorded as having failed with what they
+  would have expected, so a message lists the same expectations as
+  before; only their order may differ, tried before skipped.
+- A node that begins two alternatives of one choice is `cached`, so the
+  second alternative does not read it again.
+
+On the bassline text grammar this takes a parse from 18 ms to 7 ms on
+560 KB, against 3 ms for the hand-written reader, with no change to the
+grammar. For a source whose elements are wider than a byte `optimize`
+is `resolve`.
+
+### Caching
+
+`p.cached` keeps `p`'s last result and answers it again when `p` is asked
+at the same position: for a node that begins several alternatives.
+`p.memoize(window)` keeps the results of the last `window` positions, a
+bounded packrat table for a node the grammar backtracks over far. Both
+work in place on the node and both paths. The key is the input, its
+`stop` and `epoch`, and the position, so a result from before more input
+arrived is not reused; a reader that rewrites the buffer other than by
+appending bumps `Input.epoch`. A cached failure is recorded again, so
+messages are unchanged.
+
 ### Extending
 
 `callCC(handler)` gives `handler` the delegate parser along with the
 current `Context`. The handler can run it with `parseOn`, skip it, run
 it somewhere else or run it more than once. This is how you write
-tracing, profiling, memoisation and dispatch on what was just read.
+tracing, profiling and dispatch on what was just read.
 `succeed(value, pos)` and `fail[S, R](node, ctx)` build results and
 `failedAs(T, r)` carries a failure over to another result type. A
 handler may set `Input.stop` to make the rest of the input end early for
@@ -243,18 +317,23 @@ a delegate, which is how dialect blocks are read, or open a
 `child(parent, at, source)` input over part of what it read, a frame's
 body say; failures in a child count toward the furthest failure in
 document order and print as a path, `2.0.3`. `leaf[S, R](expected, step,
-value)` is how a new leaf is written, from its fast path and its reader.
-`children`, `replace` and `allParsers` are the graph protocol that
-`resolve` is built on.
+value)` is how a new leaf is written, from its fast path and its reader;
+give it a `kind` if the analyses may assume something of it.
+
+`children`, `replace`, `allParsers` and `rewrite(root, rule)` are the
+graph protocol that `resolve` and `optimize` are built on: `rewrite`
+offers every node to `rule` and rewires parents to what it answers. The
+nodes `optimize` makes are public, `span`, `test`, `dispatch` and
+`enableCache`, so another rewrite can use them.
 
 ### How it runs
 
 This is recursive descent over a PEG. Choice is ordered, repetition is
-possessive, there is no memoisation and left recursion is not detected.
-Each node has two paths. `parseOn` builds values and `fastParseOn` only
-recognises and allocates nothing, except for greedy repetition.
-`flatten`, `skip`, `notAhead`, `neg`, trimmers and repetition limits run
-their delegate on the fast path.
+possessive, nothing is memoised unless asked, and left recursion is not
+detected. Each node has two paths. `parseOn` builds values and
+`fastParseOn` only recognises and allocates nothing, except for greedy
+repetition. `flatten`, `skip`, `notAhead`, `neg`, trimmers and
+repetition limits run their delegate on the fast path.
 
 ## Tests
 

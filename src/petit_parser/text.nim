@@ -50,10 +50,7 @@ proc whitespace*(): TextParser[char] = chars(Whitespace, "whitespace")
 proc continuesWith(ctx: Context[string], lit: string): bool =
   ctx.pos + lit.len <= ctx.input.stop and ctx.input.source.continuesWith(lit, ctx.pos)
 
-proc str*(lit: string): TextParser[string] =
-  leaf[string, string]("'" & lit & "'",
-    (ctx: Context[string]) => (if ctx.continuesWith(lit): ctx.pos + lit.len else: -1),
-    (ctx: Context[string], stop: int) => lit)
+proc str*(lit: string): TextParser[string] = literal[string](lit, "'" & lit & "'")
 
 proc continuesWithIgnoreCase(ctx: Context[string], lit: string): bool =
   if ctx.pos + lit.len > ctx.input.stop: return false
