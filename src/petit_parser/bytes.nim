@@ -1,4 +1,4 @@
-import std/[strutils, setutils, sugar]
+import std/[strutils, setutils]
 import ./parser
 
 type ByteParser*[R] = Parser[seq[byte], R]

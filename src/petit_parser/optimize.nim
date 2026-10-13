@@ -173,8 +173,27 @@ proc leading(a: Analysis, p: ParserBase, acc: var seq[string]) =
   else:
     if p.expected notin acc: acc.add p.expected
 
+proc leadingTrimmer(p: ParserBase): ParserBase =
+  ## The trimmer `p` begins by skipping, through the nodes that start
+  ## where their first child starts and fail when it fails; nil when there
+  ## is none or the alternatives of a choice disagree. A token, a flatten,
+  ## an optional or a repetition is not seen through: where its child
+  ## begins is part of what it answers.
+  result = nil
+  case p.kind
+  of nkTrim: result = p.children[1]
+  of nkMap, nkWhere, nkNesting, nkSettable, nkSequence:
+    if p.children.len > 0: result = p.children[0].leadingTrimmer
+  of nkChoice:
+    for i, c in p.children:
+      let t = c.leadingTrimmer
+      if t.isNil or (i > 0 and t != result): return nil
+      result = t
+  else: discard
+
 proc dispatches(a: Analysis, p: ParserBase) =
-  ## A choice is told which alternatives can begin with each next element.
+  ## A choice is told which alternatives can begin with each next element,
+  ## after the trimmer they all begin with, if there is one.
   if p.kind != nkChoice or p.isDispatched: return
   let
     alts = p.children
@@ -197,7 +216,7 @@ proc dispatches(a: Analysis, p: ParserBase) =
     var names: seq[string]
     a.leading(alt, names)
     leading.add names
-  p.dispatch(table, atEnd, leading)
+  p.dispatch(table, atEnd, leading, p.leadingTrimmer)
 
 # ---------------------------------------------------------------------------
 # Caches where alternatives share a beginning

@@ -82,7 +82,7 @@ type
     replaceFn: (ParserBase, ParserBase) -> void
     nestFn: (ParserBase) -> ParserBase   ## a placeholder's counting stand-in
     cacheFn: (int) -> void               ## puts a cache over the node's own paths
-    dispatchFn: (seq[seq[int]], seq[int], seq[seq[string]]) -> void
+    dispatchFn: (seq[seq[int]], seq[int], seq[seq[string]], ParserBase) -> void
       ## a choice's: tells it which alternatives to try for each next element
 
   SourceParser*[S] = ref object of ParserBase
@@ -508,12 +508,21 @@ proc `&`*[S, A, B](a: Parser[S, A], b: Parser[S, B]): Parser[S, (A, B)] = sequen
 # a choice which alternatives can begin with each next element; it then
 # tries only those, and a miss fails as the alternatives would have.
 
+proc skipAll[S](trimmer: SourceParser[S], ctx: Context[S]): int =
+  result = ctx.pos
+  while true:
+    let next = trimmer.fastParseOn(ctx.at(result))
+    if next < 0 or next == result: return
+    result = next
+
 type ChoiceParser*[S, R] = ref object of Parser[S, R]
   alts: seq[Parser[S, R]]
-  table: seq[seq[Parser[S, R]]]   ## by next element, once dispatched
-  atEnd: seq[Parser[S, R]]        ## the alternatives tried at the end of the input
-  misses: seq[seq[ParserBase]]    ## by next element, then at the end: what the
-                                  ## alternatives not tried would have expected
+  table: seq[seq[Parser[S, R]]]   ## by next element, then at the end of the input,
+                                  ## once dispatched
+  misses: seq[seq[ParserBase]]    ## the same rows: what the alternatives not tried
+                                  ## would have expected
+  before: SourceParser[S]         ## a trimmer every alternative begins by skipping,
+                                  ## skipped once here before the next element is read
 
 proc alternatives*(names: seq[string]): string =
   ## How a choice is described by its alternatives' names.
@@ -530,35 +539,41 @@ proc choice*[S, R](alts: varargs[Parser[S, R]]): Parser[S, R] =
   type E = elementOf(S)
   template slot(ctx: Context[S]): int =
     when dispatchable(E):
-      if ctx.pos < ctx.input.stop: int(ctx.input.source[ctx.pos]) else: c.table.len
+      if ctx.pos < ctx.input.stop: int(ctx.input.source[ctx.pos]) else: c.table.high
     else:
       0
-  template candidates(ctx: Context[S]): seq[Parser[S, R]] =
-    when dispatchable(E):
-      if ctx.pos < ctx.input.stop: c.table[int(ctx.input.source[ctx.pos])] else: c.atEnd
-    else:
-      c.alts
+  # a row is read in place: a `let` of one, or an `if` choosing one, would
+  # copy it on every call
+  template candidates(i: int): seq[Parser[S, R]] =
+    when dispatchable(E): c.table[i] else: c.alts
   c.parseFn = proc (ctx: Context[S]): Result[R] =
     if c.dispatched:
-      let cands = candidates(ctx)
-      for alt in cands:
+      let
+        ctx = if c.before.isNil: ctx else: ctx.at(c.before.skipAll(ctx))
+        i = slot(ctx)
+      for alt in candidates(i):
         result = alt.parseOn(ctx)
         if result.isSuccess: return
       # the alternatives not tried would have failed here too
-      let misses = c.misses[slot(ctx)]
-      for m in misses: ctx.input.record(m, ctx.pos)
-      if cands.len == 0:
-        result = Result[R](isSuccess: false, failed: (if misses.len > 0: misses[^1] else: c), pos: ctx.pos)
+      for m in c.misses[i]: ctx.input.record(m, ctx.pos)
+      if candidates(i).len == 0:
+        result = Result[R](isSuccess: false, pos: ctx.pos,
+                           failed: (if c.misses[i].len > 0: c.misses[i][^1] else: c))
       return
     for alt in c.alts:
       result = alt.parseOn(ctx)
       if result.isSuccess: return
     if c.alts.len == 0: result = fail[S, R](c, ctx)
   c.fastFn = proc (ctx: Context[S]): int =
-    let cands = if c.dispatched: candidates(ctx) else: c.alts
-    for alt in cands:
-      let pos = alt.fastParseOn(ctx)
-      if pos >= 0: return pos
+    if c.dispatched:
+      let ctx = if c.before.isNil: ctx else: ctx.at(c.before.skipAll(ctx))
+      for alt in candidates(slot(ctx)):
+        let pos = alt.fastParseOn(ctx)
+        if pos >= 0: return pos
+    else:
+      for alt in c.alts:
+        let pos = alt.fastParseOn(ctx)
+        if pos >= 0: return pos
     -1
   c.childrenFn = proc (): seq[ParserBase] =
     for alt in c.alts: result.add alt
@@ -566,9 +581,10 @@ proc choice*[S, R](alts: varargs[Parser[S, R]]): Parser[S, R] =
     for alt in c.alts.mitems: swapIn(alt, source, target)
     for row in c.table.mitems:
       for alt in row.mitems: swapIn(alt, source, target)
-    for alt in c.atEnd.mitems: swapIn(alt, source, target)
+    if not c.before.isNil: swapIn(c.before, source, target)
   when dispatchable(E):
-    c.dispatchFn = proc (table: seq[seq[int]], atEnd: seq[int], leading: seq[seq[string]]) =
+    c.dispatchFn = proc (table: seq[seq[int]], atEnd: seq[int], leading: seq[seq[string]],
+                         before: ParserBase) =
       var byName: Table[string, ParserBase]
       proc missing(tried: seq[int]): seq[ParserBase] =
         var names: seq[string]
@@ -579,14 +595,14 @@ proc choice*[S, R](alts: varargs[Parser[S, R]]): Parser[S, R] =
         for name in names:
           if name notin byName: byName[name] = ParserBase(expected: name)
           result.add byName[name]
-      c.table = newSeq[seq[Parser[S, R]]](table.len)
+      c.table = newSeq[seq[Parser[S, R]]](table.len + 1)
       c.misses = newSeq[seq[ParserBase]](table.len + 1)
       for i, row in table:
         for a in row: c.table[i].add c.alts[a]
         c.misses[i] = missing(row)
-      c.atEnd = @[]
-      for a in atEnd: c.atEnd.add c.alts[a]
+      for a in atEnd: c.table[table.len].add c.alts[a]
       c.misses[table.len] = missing(atEnd)
+      if not before.isNil: c.before = SourceParser[S](before)
       c.dispatched = true
   ready c
 
@@ -598,13 +614,16 @@ proc `/`*[S, R](a, b: Parser[S, R]): Parser[S, R] =
     else: alts.add x
   choice(alts)
 
-proc dispatch*(c: ParserBase, table: seq[seq[int]], atEnd: seq[int], leading: seq[seq[string]]) =
+proc dispatch*(c: ParserBase, table: seq[seq[int]], atEnd: seq[int], leading: seq[seq[string]],
+               before: ParserBase = nil) =
   ## Tells a choice which of its alternatives, by index, to try when the
   ## next element is each of the `table.len` possible ones, and which at
   ## the end of the input. `leading[i]` is what alternative `i` would have
   ## expected where it cannot begin, recorded in its place when it is not
-  ## tried and nothing tried succeeds.
-  if not c.dispatchFn.isNil: c.dispatchFn(table, atEnd, leading)
+  ## tried and nothing tried succeeds. `before` is a trimmer every
+  ## alternative begins by skipping: skipped once, before the next element
+  ## is read, so that the alternatives are told apart by what follows it.
+  if not c.dispatchFn.isNil: c.dispatchFn(table, atEnd, leading, before)
 
 func isDispatched*(c: ParserBase): bool = c.dispatched
 
@@ -1016,13 +1035,6 @@ proc neg*[S](p: SourceParser[S]): Parser[S, typeof(default(S)[0])] =
 
 # ---------------------------------------------------------------------------
 # Trimming: `left` and `right` are skipped as often as they match
-
-proc skipAll[S](trimmer: SourceParser[S], ctx: Context[S]): int =
-  result = ctx.pos
-  while true:
-    let next = trimmer.fastParseOn(ctx.at(result))
-    if next < 0 or next == result: return
-    result = next
 
 proc trim*[S, R](p: Parser[S, R], left, right: SourceParser[S]): Parser[S, R] =
   var (p, left, right) = (p, left, right)

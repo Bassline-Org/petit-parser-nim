@@ -5,7 +5,7 @@ type
   JsonKind* = enum
     jkNull, jkBool, jkString, jkNumber, jkArray, jkObject
 
-  JsonValue* = object
+  JsonValue* {.acyclic.} = ref object
     case kind*: JsonKind
     of jkNull: discard
     of jkBool: boolVal*: bool
@@ -31,6 +31,13 @@ proc decoded(hi: int, lo: Option[(string, int)]): string =
   else:
     Rune(hi).toUTF8
 
+proc joined(parts: sink seq[string]): string =
+  ## the pieces of a string; most strings are one run
+  if parts.len == 1: parts[0] else: parts.join
+
+proc obj(entries: sink seq[(string, JsonValue)]): JsonValue =
+  JsonValue(kind: jkObject, objectVal: entries.toTable)
+
 proc jsonParser*(): TextParser[JsonValue] =
   let
     ws = chars({' ', '\t', '\n', '\r'}, "whitespace")
@@ -43,7 +50,8 @@ proc jsonParser*(): TextParser[JsonValue] =
       .map(m => escaped(m[1]))
     run = chars({'\x20' .. '\xFF'} - {'"', '\\'}, "character").plus.flatten
     text = delimited(ch('"'), ch('"'), (run / escape / unicode).star)
-      .map(m => m.join).trim(ws)
+      .map(joined)
+      .trim(ws)
 
     digits = digit().plus
     integer = ch('0').skip / (between('1', '9') & digit().star).skip
@@ -64,7 +72,7 @@ proc jsonParser*(): TextParser[JsonValue] =
       .map(a => JsonValue(kind: jkArray, arrayVal: a))
     entry = (text & ch(':').trim(ws)).pick(0) & value
     jsonObj = delimited(ch('{').trim(ws), ch('}').trim(ws), entry.starSeparated(comma).elements)
-      .map(es => JsonValue(kind: jkObject, objectVal: es.toTable))
+      .map(obj)
 
-  value.define(jsonObj / jsonArray / jsonNumber / jsonString / jsonLiteral)
+  value.define(jsonLiteral / jsonString / jsonObj / jsonArray / jsonNumber)
   value.complete.resolve
