@@ -283,7 +283,10 @@ does the same work in fewer steps:
   alternative whose first set is unknown or nullable is tried everywhere.
   The alternatives it skips are recorded as having failed with what they
   would have expected, so a message lists the same expectations as
-  before; only their order may differ, tried before skipped.
+  before; only their order may differ, tried before skipped. Where every
+  alternative begins by skipping the same trimmer, as in a JSON grammar
+  whose values are each `.trim(ws)`, the choice skips it once and reads
+  the element after it, instead of every alternative skipping it in turn.
 - A node that begins two alternatives of one choice is `cached`, so the
   second alternative does not read it again.
 
@@ -318,7 +321,9 @@ a delegate, which is how dialect blocks are read, or open a
 body say; failures in a child count toward the furthest failure in
 document order and print as a path, `2.0.3`. `leaf[S, R](expected, step,
 value)` is how a new leaf is written, from its fast path and its reader;
-give it a `kind` if the analyses may assume something of it.
+give it a `kind` if the analyses may assume something of it. Read the
+source in place, `ctx.input.source[i]`: a `let src = ctx.input.source`
+copies the whole source on every call.
 
 `children`, `replace`, `allParsers` and `rewrite(root, rule)` are the
 graph protocol that `resolve` and `optimize` are built on: `rewrite`
